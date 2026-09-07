@@ -54,6 +54,7 @@ journalctl --user -u formation-update.service -n 50 --no-pager
 源码包含 `nlink_parser`、其串口与协议源码、`robot_pose_ekf`、底盘包和两个编队包。
 系统仍需对应 ROS 发行版的常用消息包、serial、BFL、joint_state_publisher、
 robot_state_publisher，以及 NumPy、Matplotlib。三车已安装这些运行依赖。
+主机已补装 `liborocos-bfl-dev`，可使用同一构建脚本编译完整工作空间。
 
 ```bash
 cd /home/wheeltec/formation_ws
@@ -128,6 +129,7 @@ python src/five_ugv_formation_control/scripts/formation_logger.py --self-test
 # 主机 Noetic/Python 3：
 python3 src/five_ugv_formation_control/scripts/displacement_follower.py --self-test
 python3 src/five_ugv_uwb_localization/test/test_realtime_localizer.py
+python3 test/test_update.py
 ```
 
 `robot_pose_ekf` 源码来自 ugv0 原工作空间（1.14.5）。`nlink_parser` 及内嵌依赖以源码

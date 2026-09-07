@@ -66,5 +66,13 @@ with tempfile.TemporaryDirectory(prefix='formation-update-') as directory:
     run('git', 'checkout', '-qb', 'local-work', cwd=robot)
     assert run('bash', 'scripts/update.sh', cwd=robot, ok=False).returncode != 0
     assert run('git', 'branch', '--show-current', cwd=robot).stdout.strip() == 'local-work'
+    run('git', 'checkout', '-q', 'master', cwd=robot)
+    run('git', 'config', 'user.name', 'Test', cwd=robot)
+    run('git', 'config', 'user.email', 'test@example.invalid', cwd=robot)
+    (robot / 'version').write_text('local commit\n')
+    run('git', 'commit', '-qam', 'local commit', cwd=robot)
+    local_revision = run('git', 'rev-parse', 'HEAD', cwd=robot).stdout
+    assert run('bash', 'scripts/update.sh', cwd=robot, ok=False).returncode != 0
+    assert run('git', 'rev-parse', 'HEAD', cwd=robot).stdout == local_revision
 
-print('Update checks passed: dirty files, running ROS, failed build retry and branch protection.')
+print('Update checks passed: dirty files, running ROS, failed build retry, branches and local commits.')

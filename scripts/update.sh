@@ -15,6 +15,7 @@ if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
     exit 1
 fi
 [[ "$(git symbolic-ref --short HEAD)" == master ]] || { echo 'Expected master branch.' >&2; exit 1; }
+git merge-base --is-ancestor HEAD origin/master || { echo 'Local commits are not on the server; update stopped.' >&2; exit 1; }
 git merge --ff-only origin/master
 revision=$(git rev-parse HEAD)
 if [[ ! -f .local/built-revision ]] || [[ "$(<.local/built-revision)" != "$revision" ]]; then
