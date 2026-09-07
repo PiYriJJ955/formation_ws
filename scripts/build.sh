@@ -8,4 +8,5 @@ if [[ -f /opt/ros/melodic/setup.bash ]]; then
 else
     source /opt/ros/noetic/setup.bash
 fi
-catkin_make -j2 -l2 -DPYTHON_EXECUTABLE="$(command -v "python${ROS_PYTHON_VERSION}")" "$@"
+catkin_make -j2 -l2 -DCATKIN_WHITELIST_PACKAGES= -DCATKIN_ENABLE_TESTING=OFF \
+    -DPYTHON_EXECUTABLE="$(command -v "python${ROS_PYTHON_VERSION}")" "$@"

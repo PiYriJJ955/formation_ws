@@ -8,4 +8,3 @@ Type=oneshot
 WorkingDirectory=/home/wheeltec/formation_ws
 ExecStart=/bin/bash /home/wheeltec/formation_ws/scripts/update.sh
 TimeoutStartSec=20min
-

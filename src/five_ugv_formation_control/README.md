@@ -1,8 +1,9 @@
 # five_ugv_formation_control
 
-五车编队中部署在 UGV1 上的位移跟随控制器。UGV0 是领航车；本节点读取两车
+可部署在 UGV1、UGV2 等跟随车上的位移跟随控制器。UGV0 默认是领航车；本节点读取两车
 的 UWB 位置、`odom_combined` 航向，以及 UGV0 的里程计实测速度，向
-`/ugv1/cmd_vel` 发布速度。
+`/ugv<ugv_id>/cmd_vel` 发布速度。车辆编号默认读取车端 `UGV_ID`，也可通过
+`ugv_id` 参数指定；领航车可通过 `leader_id` 参数指定。
 
 ## 控制律
 
@@ -76,9 +77,9 @@ yaw_uwb = yaw_odom + yaw_offset
 ## 编译与运行
 
 ```bash
-cd /mnt
-catkin_make --pkg five_ugv_formation_control
-source devel/setup.bash
+cd /home/wheeltec/formation_ws
+bash scripts/build.sh
+source scripts/env.sh
 roslaunch five_ugv_formation_control follower.launch
 ```
 
@@ -121,11 +122,11 @@ rostopic pub -1 /five_ugv_formation/enable std_msgs/Bool "data: false"
 
 ## 编队数据记录
 
-`follower.launch` 默认同时启动 `/ugv1/formation_logger`。停止 launch 时，数据和
+`follower.launch` 默认同时启动本车命名空间的 `formation_logger`。停止 launch 时，数据和
 图像保存到：
 
 ```text
-/home/wheeltec/wheeltec_robot/formation_logs/ugv1_formation_时间戳/
+/home/wheeltec/formation_ws/logs/formation/ugv1_formation_时间戳/
 ```
 
 每次实验包含：
@@ -158,7 +159,7 @@ CSV 记录两车 UWB 位置、原始 odom 航向、目标点、位置和控制�
 
 ```bash
 roslaunch five_ugv_formation_control follower.launch \
-  log_root:=/home/wheeltec/wheeltec_robot/formation_logs
+  log_root:=/home/wheeltec/formation_ws/logs/formation
 
 roslaunch five_ugv_formation_control follower.launch enable_logger:=false
 ```

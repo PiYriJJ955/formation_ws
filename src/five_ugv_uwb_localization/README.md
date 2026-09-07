@@ -1,7 +1,8 @@
 # five_ugv_uwb_localization
 
-五车系统中部署在 UGV1 上的 UWB 定位功能包。它启动本车 LinkTrack、鲁棒二维
-定位器和可选离线记录器，输出统一 `uwb_map` 坐标系中的 UGV1 位置。
+多车通用 UWB 定位功能包。它启动本车 LinkTrack、鲁棒二维定位器和可选离线记录器，
+输出统一 `uwb_map` 坐标系中的本车位置。编号默认读取 `UGV_ID`，串口读取 `UWB_PORT`。
+下面以 UGV1 的话题为例。
 
 ## 话题
 
@@ -15,13 +16,14 @@
 ## 编译与启动
 
 ```bash
-cd /mnt
-catkin_make --pkg five_ugv_uwb_localization
-source devel/setup.bash
-roslaunch five_ugv_uwb_localization ugv1.launch
+cd /home/wheeltec/formation_ws
+bash scripts/build.sh
+source scripts/env.sh
+roslaunch five_ugv_uwb_localization ugv.launch
 ```
 
-`ugv1.launch` 在 `/ugv1` 命名空间启动底盘和 LinkTrack 节点。只启动记录器时使用：
+`ugv.launch` 按本车编号选择命名空间并启动底盘和 LinkTrack 节点，也可传入
+`ugv_id:=2`、`port_name:=/dev/ttyCH343USB1`。只启动记录器时使用：
 
 ```bash
 roslaunch five_ugv_uwb_localization offline_logger_only.launch
