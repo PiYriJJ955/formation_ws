@@ -28,7 +28,8 @@ git push
 
 小车的 `formation-update.timer` 每分钟检查一次。检测到本机 ROS 正在运行时只 fetch；
 ROS 停止后，工作区干净且位于 `master` 时执行快进更新与构建。
-更新或构建失败会保留错误日志，下轮重试；本地修改、分叉和切换分支都需人工处理。
+每轮输出保存在 `.local/update.log`（保留最近一轮）。更新或构建失败下轮重试；
+本地修改、分叉和切换分支都需人工处理。
 更新期间保持 ROS 停止。各车独立更新，开始实验前请核对三车提交号。
 不会自动启动底盘或控制器。
 
@@ -41,7 +42,7 @@ bash scripts/update.sh
 git rev-parse --short HEAD
 cat .local/built-revision
 systemctl --user status formation-update.timer
-journalctl --user -u formation-update.service -n 50 --no-pager
+tail -n 50 .local/update.log
 ```
 
 断网时已有代码可继续使用；恢复联网后重试。需要回退发布时，在主机

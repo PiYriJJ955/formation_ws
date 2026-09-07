@@ -4,6 +4,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mkdir -p .local
 exec 9>.local/update.lock
 flock -n 9 || exit 0
+exec > >(tee .local/update.log) 2>&1
 git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=20 fetch origin master
 # Defer checkout/build while any local ROS launch or controller is running.
 if pgrep -f '(^|/)(roslaunch|roscore|rosmaster)( |$)|wheeltec_robot_node|displacement_follower.py|robust_uwb_localizer.py|/lib/nlink_parser/' >/dev/null; then
