@@ -1,0 +1,12 @@
+<launch>
+  <arg name="robot_name" default="leader" />
+  <arg name="uwb_name" default="uwb_front" />
+  <arg name="port_name" default="/dev/ttyCH343USB0" />
+
+  <group ns="$(arg robot_name)/$(arg uwb_name)">
+    <node pkg="nlink_parser" type="iot" name="iot" output="screen">
+      <param name="port_name" type="str" value="$(arg port_name)" />
+      <param name="baud_rate" type="int" value="921600" />
+    </node>
+  </group>
+</launch>

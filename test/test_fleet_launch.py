@@ -1,0 +1,43 @@
+#!/usr/bin/env python
+"""Resolve every vehicle's launch configuration without starting ROS nodes."""
+from __future__ import print_function
+
+import os
+
+import roslaunch
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def resolve(package, launch, args):
+    config = roslaunch.config.ROSLaunchConfig()
+    roslaunch.xmlloader.XmlLoader().load(
+        os.path.join(ROOT, 'src', package, 'launch', launch),
+        config, argv=args, verbose=False)
+    return config
+
+
+for vehicle in range(3):
+    os.environ['UGV_ID'] = str(vehicle)
+    os.environ['UWB_PORT'] = '/dev/test_uwb'
+    prefix = '/ugv%d/' % vehicle
+    config = resolve('five_ugv_uwb_localization', 'ugv.launch', [])
+    assert all(node.namespace == prefix for node in config.nodes)
+    assert config.params[prefix + 'linktrack/port_name'].value == '/dev/test_uwb'
+    assert config.params[prefix + 'uwb_localizer/input_topic'].value == prefix + 'nlink_linktrack_nodeframe2'
+    assert any(node.package == 'robot_pose_ekf' for node in config.nodes)
+
+    if vehicle:
+        config = resolve('five_ugv_formation_control', 'follower.launch', [])
+        assert all(node.namespace == prefix for node in config.nodes)
+        for name in ('formation_controller', 'formation_logger'):
+            assert config.params[prefix + name + '/robot_name'].value == 'ugv%d' % vehicle
+            assert config.params[prefix + name + '/cmd_vel_topic'].value == prefix + 'cmd_vel'
+        assert config.params[prefix + 'formation_controller/enabled'].value is False
+        assert config.params[prefix + 'formation_logger/controller_namespace'].value == prefix + 'formation_controller'
+        assert config.params[prefix + 'formation_controller/leader_pose_topic'].value == '/ugv0/uwb/pose'
+
+config = resolve('five_ugv_formation_control', 'follower.launch', ['ugv_id:=1', 'leader_id:=2'])
+assert config.params['/ugv1/formation_controller/leader_pose_topic'].value == '/ugv2/uwb/pose'
+assert config.params['/ugv1/formation_logger/leader_name'].value == 'ugv2'
+print('Fleet launch checks passed for ugv0, ugv1 and ugv2.')

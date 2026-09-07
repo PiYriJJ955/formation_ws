@@ -1,0 +1,15 @@
+
+rate: 20
+kp: 0.8
+kyaw: 1.5
+vmax: 0.15
+wmax: 0.8
+
+ugv1_offset_x: -0.8
+ugv1_offset_y: 0.55
+ugv2_offset_x: -0.8
+ugv2_offset_y: -0.55
+ugv3_offset_x: -1.6
+ugv3_offset_y: 0.55
+ugv4_offset_x: -1.6
+ugv4_offset_y: -0.55

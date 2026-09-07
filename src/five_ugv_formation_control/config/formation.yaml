@@ -1,0 +1,39 @@
+# Controller
+control_rate: 20.0
+k_position: 0.8
+k_heading: 1.8
+k_heading_sync: 1.2
+max_linear: 0.15
+max_angular: 0.8
+rotate_in_place_threshold: 0.7
+velocity_deadband: 0.02
+
+# Position/heading coordination. Distances in m, angles in rad.
+heading_blend_distance: 0.50
+heading_blend_max: 0.35  # Must be < 0.5 to retain position correction.
+position_tolerance: 0.10  # HOLD entry radius
+hold_exit_tolerance: 0.18
+hold_enter_duration: 0.4  # Continuous arrival + stationary confirmation, seconds
+heading_tolerance: 0.0872664626  # 5 degrees
+hold_max_angular: 0.35
+
+# Input watchdog
+data_timeout: 0.5
+
+# UGV0 measured body velocity from nav_msgs/Odometry.twist.twist.
+# Linear velocity is rotated into uwb_map using the aligned UGV0 heading.
+leader_linear_deadband: 0.03
+leader_angular_deadband: 0.03
+
+# Yaw alignment. With auto_align_yaw=true, point every UGV toward this
+# direction in uwb_map before starting the node. Radians; 0 means UWB +X.
+auto_align_yaw: true
+initial_uwb_yaw: 0.0
+
+# Used only when auto_align_yaw=false. Radians:
+# yaw_in_uwb = yaw_from_odom_combined + yaw_offset
+leader_yaw_offset: 0.0
+self_yaw_offset: 0.0
+
+# Safety: require /ugvX/uwb/valid and start disabled.
+enabled: false

@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>five_ugv_uwb_localization</name>
+  <version>1.0.0</version>
+  <description>UGV1 UWB localization for a five-UGV fleet.</description>
+  <maintainer email="user@example.com">user</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>rospy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>tf</depend>
+  <depend>nlink_parser</depend>
+  <exec_depend>turn_on_wheeltec_robot</exec_depend>
+  <exec_depend>python-matplotlib</exec_depend>
+  <exec_depend>python-numpy</exec_depend>
+  <export/>
+</package>

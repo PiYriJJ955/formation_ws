@@ -1,0 +1,14 @@
+<launch>
+  <arg name="ugv_id" default="$(optenv UGV_ID 1)"/>
+
+  <group ns="ugv$(arg ugv_id)">
+    <node pkg="five_ugv_uwb_localization"
+          type="formation_controller.py"
+          name="formation_controller"
+          output="screen">
+      <param name="ugv_id" value="$(arg ugv_id)"/>
+      <rosparam command="load"
+        file="$(find five_ugv_uwb_localization)/config/formation.yaml"/>
+    </node>
+  </group>
+</launch>

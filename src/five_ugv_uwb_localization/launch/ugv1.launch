@@ -1,0 +1,8 @@
+<launch>
+  <arg name="start_chassis" default="true"/>
+
+  <include file="$(find five_ugv_uwb_localization)/launch/ugv.launch">
+    <arg name="ugv_id" value="1"/>
+    <arg name="start_chassis" value="$(arg start_chassis)"/>
+  </include>
+</launch>

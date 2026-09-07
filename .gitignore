@@ -1,0 +1,14 @@
+/AGENTS.md
+/.agents/
+/.codex/
+/.local/
+.vscode/
+build/
+devel/
+install/
+logs/
+*_logs/
+.catkin_workspace
+__pycache__/
+*.py[cod]
+*.bag

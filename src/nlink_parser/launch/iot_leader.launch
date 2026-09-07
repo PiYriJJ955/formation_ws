@@ -1,0 +1,13 @@
+<launch>
+  <include file="$(find nlink_parser)/launch/iot_base.launch">
+    <arg name="robot_name" value="leader" />
+    <arg name="uwb_name" value="uwb_left" />
+    <arg name="port_name" value="/dev/ttyCH343USB2" />
+  </include>
+
+  <include file="$(find nlink_parser)/launch/iot_base.launch">
+    <arg name="robot_name" value="leader" />
+    <arg name="uwb_name" value="uwb_right" />
+    <arg name="port_name" value="/dev/ttyCH343USB3" />
+  </include>
+</launch>

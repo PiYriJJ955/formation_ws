@@ -1,0 +1,21 @@
+<launch>
+  <arg name="mapping_mode"  default="gmapping"/>
+  <arg name="odom_frame_id" default="odom_combined"/>
+
+  <include file="$(find turn_on_wheeltec_robot)/launch/turn_on_wheeltec_robot.launch">
+    <arg name="navigation" value="true"/>
+    <arg name="is_cartographer" value="false"/>
+    <arg name="odom_frame_id"   value="$(arg odom_frame_id)"/>
+  </include>
+
+  <include file="$(find turn_on_wheeltec_robot)/launch/wheeltec_lidar.launch" />
+
+  <include file="$(find turn_on_wheeltec_robot)/launch/include/algorithm_gmapping.launch">
+      <arg name="scan_topic" value="/scan" />
+  </include>
+
+  <node pkg="rosnode" type="rosnode" name="kill_move_base" 
+        args="kill /move_base" 
+        launch-prefix="bash -c 'sleep 3; $0 $@' " />
+
+</launch>

@@ -1,0 +1,46 @@
+<launch>
+  <arg name="ugv_id" default="$(optenv UGV_ID 1)"/>
+  <arg name="port_name" default="$(optenv UWB_PORT /dev/ttyCH343USB2)"/>
+  <arg name="baud_rate" default="921600"/>
+  <arg name="enable_logger" default="true"/>
+  <arg name="log_root" default="$(optenv FORMATION_WS /home/wheeltec/formation_ws)/logs/uwb"/>
+
+  <group ns="ugv$(arg ugv_id)">
+
+    <node pkg="nlink_parser"
+          type="linktrack"
+          name="linktrack"
+          output="screen">
+      <param name="port_name" value="$(arg port_name)"/>
+      <param name="baud_rate" value="$(arg baud_rate)"/>
+      <remap from="/nlink_linktrack_nodeframe2"
+             to="/ugv$(arg ugv_id)/nlink_linktrack_nodeframe2"/>
+    </node>
+
+    <node pkg="five_ugv_uwb_localization"
+          type="robust_uwb_localizer.py"
+          name="uwb_localizer"
+          output="screen">
+      <rosparam command="load"
+                file="$(find five_ugv_uwb_localization)/config/final_localization.yaml"/>
+      <param name="input_topic"
+             value="/ugv$(arg ugv_id)/nlink_linktrack_nodeframe2"/>
+    </node>
+
+    <!-- Each UGV records only its own localization/UWB data -->
+    <node if="$(arg enable_logger)"
+          pkg="five_ugv_uwb_localization"
+          type="offline_logger.py"
+          name="offline_logger"
+          output="screen">
+      <param name="ugv_id"
+             value="$(arg ugv_id)"/>
+      <param name="output_root"
+             value="$(arg log_root)"/>
+      <!-- 0 = record until Ctrl+C -->
+      <param name="duration"
+             value="0.0"/>
+    </node>
+
+  </group>
+</launch>

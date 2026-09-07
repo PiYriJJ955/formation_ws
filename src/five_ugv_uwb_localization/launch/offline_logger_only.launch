@@ -1,0 +1,16 @@
+<launch>
+  <arg name="ugv_id" default="$(optenv UGV_ID 1)"/>
+  <arg name="log_root" default="$(optenv FORMATION_WS /home/wheeltec/formation_ws)/logs/uwb"/>
+  <group ns="ugv$(arg ugv_id)">
+    <node pkg="five_ugv_uwb_localization"
+          type="offline_logger.py"
+          name="offline_logger"
+          output="screen">
+      <param name="ugv_id" value="$(arg ugv_id)"/>
+      <param name="output_root"
+             value="$(arg log_root)"/>
+      <param name="duration"
+             value="0.0"/>
+    </node>
+  </group>
+</launch>
