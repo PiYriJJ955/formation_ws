@@ -4,7 +4,7 @@
 
 | 小车 | IP | 工作空间 | UWB 串口 | 车型 |
 |---|---|---|---|---|
-| ugv0 | 192.168.0.111 | /home/wheeltec/formation_ws | /dev/ttyCH343USB2 | mini_mec |
+| ugv0 | 192.168.0.111 | /home/wheeltec/formation_ws | /dev/ttyCH343USB2 | mini_4wd |
 | ugv1 | 192.168.0.112 | /home/wheeltec/formation_ws | /dev/ttyCH343USB2 | mini_4wd |
 | ugv2 | 192.168.0.109 | /home/wheeltec/formation_ws | /dev/ttyCH343USB1 | mini_4wd |
 
