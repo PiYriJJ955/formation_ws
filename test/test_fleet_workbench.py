@@ -15,22 +15,26 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from fleet_console import DEFAULTS, FleetConsole, RobotSession
+from fleet_console import DEFAULTS, FleetConsole, RobotSession, load_settings
 from fleet_deploy import parse_robot_config, replace_setting, robot_number, update_identity
 from fleet_terminal import Terminal
-from fleet_workbench import FleetWorkbench, Monitor, launch_command, localization_config, saved_limits, session_limits
+from fleet_workbench import FleetWorkbench, Monitor, launch_command, localization_config, saved_linear_limit, session_limits
 
 DEFAULTS = dict(DEFAULTS, password="test-secret")
 
 
 class WorkbenchChecks(unittest.TestCase):
-    def test_saved_limits_follow_ip_and_reach_launch(self):
-        options = dict(DEFAULTS, linear_limits_json=json.dumps({'192.0.2.1': 0.08}))
-        self.assertEqual(session_limits(options, {'192.0.2.1': 4, '192.0.2.2': 2}), {'4': 0.08, '2': 0.15})
+    def test_uniform_limit_reaches_all_launches_and_migrates_settings(self):
+        options = dict(DEFAULTS, linear_limits_json=json.dumps({'192.0.2.1': 0.08, '192.0.2.2': 0.15}))
+        self.assertEqual(saved_linear_limit(DEFAULTS), 0.15)
+        self.assertEqual(session_limits(options, {'192.0.2.1': 4, '192.0.2.2': 2}), {'4': 0.08, '2': 0.08})
         self.assertIn('max_linear:=0.08', launch_command('follower', options, '192.0.2.1', 'ugv4', '/tmp/stage'))
-        for value in (-1, 0.51, float('nan'), float('inf'), True, '0.1'):
+        options['linear_limit'] = '0.12'
+        self.assertEqual(session_limits(options, {'192.0.2.99': 7}), {'7': 0.12})  # Newly discovered car.
+        self.assertIn('max_linear:=0.12', launch_command('follower', options, '192.0.2.2', 'ugv2', '/tmp/stage'))
+        for value in (-1, 0.51, float('nan'), float('inf'), True, 'text'):
             with self.assertRaises(ValueError):
-                saved_limits(dict(options, linear_limits_json=json.dumps({'192.0.2.1': value})))
+                saved_linear_limit(dict(options, linear_limit=value))
 
     def test_uwb_cannot_share_chassis_serial_through_alias(self):
         from fleet_ros import check_serial
@@ -322,39 +326,41 @@ class WorkbenchChecks(unittest.TestCase):
             app = FleetConsole(root, Path(directory) / 'settings.json')
             try:
                 wb = app.workbench
-                self.assertEqual(len(wb.limit_rows), 5)
                 ip = '192.168.0.106'
-                wb.limit_rows[ip][1].set('0.12')
+                wb.limit_input.set('0.12')
                 wb.apply_limits()
-                self.assertEqual(json.loads(app.config_path.read_text())['options']['linear_limits_json'],
-                                 app.vars['linear_limits_json'].get())
-                self.assertEqual(saved_limits(app.current_options())[ip], 0.12)
-                wb.active_identities = {ip: 1}
-                wb.current_ids = [1]
+                restored, _ = load_settings(app.config_path)
+                self.assertEqual(saved_linear_limit(restored), 0.12)
+                wb.active_identities = {host: n for n, host in enumerate(app.robots, 1)}
+                wb.current_ids = list(wb.active_identities.values())
                 monitor = wb.monitor = SimpleNamespace(ready=True, last=time.monotonic(),
                                                       limits={'1': 0.15}, limit_status={},
                                                       enable=False, enable_sequence=0)
                 wb.apply_limits()
-                self.assertEqual(monitor.limits, {'1': 0.12})
+                self.assertEqual(monitor.limits, {str(n): 0.12 for n in range(1, 6)})
                 with patch.object(wb, 'fresh', return_value=True):
                     wb.set_enabled(True)
                     self.assertFalse(monitor.enable)  # No readback, including older controllers.
-                    monitor.limit_status = {'1': {'ready': True, 'applied': 0.12, 'requested': 0.12}}
+                    monitor.limit_status = {str(n): {'ready': True, 'applied': 0.12, 'requested': 0.12}
+                                            for n in range(1, 6)}
                     wb.set_enabled(True)
                     self.assertTrue(monitor.enable)
                     wb.refresh_limits()
-                    self.assertIn('已生效', wb.limit_rows[ip][2].get())
-                    wb.limit_rows[ip][1].set('0.09')
+                    self.assertEqual(wb.limits_status.get(), '已生效 5/5')
+                    wb.limit_input.set('0.09')
                     wb.refresh_limits()
-                    self.assertEqual(wb.limit_rows[ip][1].get(), '0.09')  # Refresh retains unsaved edits.
+                    self.assertEqual(wb.limit_input.get(), '0.09')  # Refresh retains unsaved edits.
                     wb.apply_limits()
                     self.assertFalse(wb.limit_ready(1))  # Old ACK cannot confirm a changed limit.
-                wb.limit_rows[ip][1].set('nan')
+                    self.assertIn('已生效 0/5', wb.limits_status.get())
+                wb.limit_input.set('nan')
                 with patch.object(app.messagebox, 'showerror') as error:
                     wb.apply_limits()
                     error.assert_called_once()
-                self.assertEqual(saved_limits(app.current_options())[ip], 0.09)
-                wb.limit_rows[ip][1].set('0.09')
+                self.assertEqual(saved_linear_limit(app.current_options()), 0.09)
+                wb.limit_input.set('0')
+                wb.apply_limits()
+                self.assertEqual(monitor.limits, {str(n): 0.0 for n in range(1, 6)})
                 wb.monitor = None
                 self.assertEqual([app.notebook.tab(tab, 'text') for tab in app.notebook.tabs()],
                                  ['扫描与连接', '编队算法', '小车定位图'])

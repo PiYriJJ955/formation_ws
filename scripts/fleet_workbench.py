@@ -23,7 +23,7 @@ LOCALIZATION = ROOT / 'src/five_ugv_uwb_localization'
 DEFAULTS = {
     'leader': 'ugv1', 'formation_selected': '192.168.0.106,192.168.0.108,192.168.0.109,192.168.0.110,192.168.0.114',
     'anchors_json': '',
-    'linear_limits_json': '{}', 'fold_limits': True,
+    'linear_limit': '',
     'active_tab': '0', 'formation_step': '0', 'fold_keyboard': True, 'fold_logs': True,
 }
 COLORS = ['#1976d2', '#e76622', '#009688', '#9b51b6', '#c0395a', '#8a7600']
@@ -31,20 +31,23 @@ KEY_DIRECTIONS = {'w': (1, 0), 'up': (1, 0), 's': (-1, 0), 'down': (-1, 0),
                   'a': (0, 1), 'left': (0, 1), 'd': (0, -1), 'right': (0, -1)}
 
 
-def saved_limits(options):
-    values = json.loads(options.get('linear_limits_json', '{}'))
-    if not isinstance(values, dict):
-        raise ValueError('线速度约束配置应为 IP 与上限的对应表')
-    for ip, value in values.items():
-        ipaddress.IPv4Address(ip)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 0.5:
-            raise ValueError('%s：线速度上限必须在 0–0.5 m/s 之间' % ip)
-    return values
+def saved_linear_limit(options):
+    value = options.get('linear_limit', '')
+    if value == '':
+        # Migrate saved per-IP limits without increasing any vehicle's bound.
+        previous = json.loads(options.get('linear_limits_json', '{}'))
+        value = min(previous.values()) if previous else 0.15
+    if isinstance(value, bool):
+        raise ValueError('线速度上限必须在 0–0.5 m/s 之间')
+    value = float(value)
+    if not 0 <= value <= 0.5:
+        raise ValueError('线速度上限必须在 0–0.5 m/s 之间')
+    return value
 
 
 def session_limits(options, identities):
-    values = saved_limits(options)
-    return {str(number): values.get(ip, 0.15) for ip, number in identities.items()}
+    value = saved_linear_limit(options)
+    return {str(number): value for number in identities.values()}
 
 
 @lru_cache(maxsize=16)
@@ -98,7 +101,7 @@ def launch_command(step, options, ip, name, remote, row=None):
             raise ValueError('领航车不启动跟随控制器')
         command = ('%s check --step follower --ids %d; exec flock -n "$HOME/.cache/formation-console/follower.lock" '
                    'roslaunch five_ugv_formation_control follower.launch ugv_id:=%d leader_id:=%d auto_enable:=false max_linear:=%s' %
-                   (helper, number, number, leader, saved_limits(options).get(ip, 0.15)))
+                   (helper, number, number, leader, saved_linear_limit(options)))
     else:
         raise ValueError('未知启动步骤')
     return ros_command(options, ip, command)
@@ -197,7 +200,6 @@ class FleetWorkbench:
         self.terminals = []
         self.monitor = None
         self.active_identities = {}
-        self.limit_rows = {}
         self.keys_down, self.key_releases = set(), {}
         self.keyboard_direction = None
         self.run_id = uuid.uuid4().hex
@@ -312,7 +314,7 @@ class FleetWorkbench:
                 self.vehicles.item(ip, values=values)
             else:
                 self.vehicles.insert('', 'end', iid=ip, values=values)
-        if hasattr(self, 'limits_panel'):
+        if hasattr(self, 'limit_input'):
             self.refresh_limits()
 
     def addresses(self):
@@ -392,7 +394,7 @@ class FleetWorkbench:
             return
         try:
             options = self.app.current_options()
-            saved_limits(options)
+            saved_linear_limit(options)
             addresses = self.addresses()
             ipaddress.IPv4Address(options['master_ip'])
             robot_number(options['leader'])
@@ -770,67 +772,40 @@ class FleetWorkbench:
         return row.get('ready', False) and expected is not None and row.get('applied') == row.get('requested') == expected
 
     def refresh_limits(self):
-        values = saved_limits(self.app.current_options())
-        for ip in list(self.limit_rows):
-            if ip not in self.app.robots:
-                self.limit_rows.pop(ip)[0].master.destroy()
-        for index, ip in enumerate(sorted(self.app.robots, key=ipaddress.IPv4Address)):
-            row = self.app.robots[ip]
-            name = row.get('pending_id') or row.get('robot_id') or row.get('name', ip)
-            if ip not in self.limit_rows:
-                card = self.ttk.Frame(self.limits_panel, padding=(5, 2))
-                card.grid(row=index // 5, column=index % 5, sticky='nsew')
-                self.limits_panel.columnconfigure(index % 5, weight=1)
-                label = self.ttk.Label(card)
-                label.pack(anchor='w')
-                draft = self.tk.StringVar(value=str(values.get(ip, 0.15)))
-                self.ttk.Spinbox(card, from_=0, to=0.5, increment=0.01, width=9,
-                                 textvariable=draft).pack(anchor='w')
-                status = self.tk.StringVar()
-                self.ttk.Label(card, textvariable=status).pack(anchor='w')
-                self.limit_rows[ip] = (label, draft, status)
-            label, draft, status = self.limit_rows[ip]
-            label.master.grid_configure(row=index // 5, column=index % 5)
-            number = self.active_identities.get(ip)
-            label.configure(text='%s · %s%s' % (name, ip, '（领航）' if name == self.app.vars['leader'].get() else ''))
-            value = values.get(ip, 0.15)
-            try:
-                editing = float(draft.get()) != value
-            except ValueError:
-                editing = True
-            if editing:
-                message = '尚未保存'
-            elif number is None or not self.monitor or not self.monitor.ready:
-                message = '已保存 %g · 待连接' % value
-            elif self.limit_ready(number):
-                message = '已生效 %g m/s' % value
-            else:
-                message = '待确认 · 检查连接 / 版本'
-            status.set(message)
+        value = saved_linear_limit(self.app.current_options())
+        try:
+            editing = float(self.limit_input.get()) != value
+        except ValueError:
+            editing = True
+        if editing:
+            message = '尚未应用'
+        elif not self.active_identities or not self.monitor or not self.monitor.ready:
+            message = '已保存 %g m/s · 待连接' % value
+        else:
+            pending = [number for number in self.active_identities.values() if not self.limit_ready(number)]
+            total = len(self.active_identities)
+            message = '已生效 %d/%d' % (total - len(pending), total)
+            if pending:
+                message += ' · 待确认 ' + '/'.join('ugv%d' % n for n in sorted(pending))
+            other = len(set(self.app.robots) - set(self.active_identities))
+            if other:
+                message += ' · 待启动 %d' % other
+        self.limits_status.set(message)
 
     def apply_limits(self):
         if self.worker and self.worker.is_alive():
-            self.limits_status.set('启动任务执行中，请完成后再保存限速。')
+            self.limits_status.set('启动中，请完成后再应用')
             return
         try:
-            values = saved_limits(self.app.current_options())
-            for ip, (_, draft, _) in self.limit_rows.items():
-                try:
-                    value = float(draft.get())
-                except ValueError:
-                    raise ValueError('%s：请输入 0–0.5 m/s 的线速度上限' % ip)
-                if not 0 <= value <= 0.5:
-                    raise ValueError('%s：线速度上限必须在 0–0.5 m/s 之间' % ip)
-                values[ip] = value
-            self.app.vars['linear_limits_json'].set(json.dumps(values, sort_keys=True))
+            value = saved_linear_limit({'linear_limit': float(self.limit_input.get())})
+            self.app.vars['linear_limit'].set(str(value))
             self.app.save()
             if self.monitor:
                 self.monitor.limits = session_limits(self.app.current_options(), self.active_identities)
             self.update_keyboard(time.monotonic())
             self.refresh_limits()
-            self.limits_status.set('已保存；在线参与车辆等待回读确认，其余车辆在下次启动时应用。')
-        except ValueError as error:
-            self.app.messagebox.showerror('线速度约束', str(error))
+        except ValueError:
+            self.app.messagebox.showerror('线速度约束', '请输入 0–0.5 m/s 的线速度上限')
 
     def make_map(self):
         page = self.ttk.Frame(self.app.notebook, padding=10)
@@ -854,16 +829,17 @@ class FleetWorkbench:
         self.ttk.Button(pad, text='停车 / 禁用跟随（空格 / Esc）', command=self.emergency).pack(side='left')
         self.ttk.Label(page, text='W / ↑ 前进；S / ↓ 后退；A / ← 左转；D / → 右转。按住行驶，松键停车；离开控制区后需重新点击启用。').pack(anchor='w')
         self.ttk.Label(page, textvariable=self.keyboard_status).pack(anchor='w')
-        limits = self.fold(page, '所有小车线速度上限（m/s）', 'fold_limits')
-        self.limits_panel = self.ttk.Frame(limits)
-        self.limits_panel.pack(fill='x')
+        limits = self.ttk.Frame(page)
+        limits.pack(fill='x', pady=5)
+        self.ttk.Label(limits, text='全车线速度上限 m/s').pack(side='left', padx=(4, 5))
+        self.limit_input = self.tk.StringVar(value=str(saved_linear_limit(self.app.current_options())))
+        self.ttk.Spinbox(limits, from_=0, to=0.5, increment=0.01, width=7,
+                         textvariable=self.limit_input).pack(side='left')
+        self.ttk.Button(limits, text='应用到全部', command=self.apply_limits).pack(side='left', padx=8)
+        self.ttk.Label(limits, text='0–0.5；0 仅停止平移').pack(side='left')
+        self.limits_status = self.tk.StringVar()
+        self.ttk.Label(limits, textvariable=self.limits_status, wraplength=430).pack(side='left', padx=10)
         self.refresh_limits()
-        actions = self.ttk.Frame(limits)
-        actions.pack(fill='x', pady=(4, 0))
-        self.ttk.Button(actions, text='保存并应用', command=self.apply_limits).pack(side='left', padx=5)
-        self.ttk.Label(actions, text='范围 0–0.5；0 仅停止平移。跟随车需保留比领航车更大的追赶速度余量。').pack(side='left')
-        self.limits_status = self.tk.StringVar(value='按 IP 记忆；领航键盘与跟随控制器均受限。旧版跟随控制器需同步仓库并重启。')
-        self.ttk.Label(limits, textvariable=self.limits_status, wraplength=1080).pack(anchor='w', padx=5)
         self.map_status = self.tk.StringVar(value='尚未连接。基站坐标读取自 final_localization.yaml；单位：米。')
         self.ttk.Label(page, textvariable=self.map_status, wraplength=1080).pack(fill='x', pady=7)
         self.ttk.Label(page, text='三角形：基站　圆点：车辆　实线：实际轨迹　虚线：目标轨迹 / 误差　灰色：定位过期或无效').pack(anchor='w')
