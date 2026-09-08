@@ -195,6 +195,8 @@ class WorkbenchChecks(unittest.TestCase):
                 app.notebook.select(2)
                 root.deiconify()
                 root.update()
+                wb.open_leader_control()
+                root.update()
                 wb.keyboard.focus_force()
                 root.update()
                 wb.activate_keyboard()
@@ -307,7 +309,7 @@ class WorkbenchChecks(unittest.TestCase):
                 app.save()
                 saved = json.loads(app.config_path.read_text())
                 self.assertEqual(saved['options']['linear'], '0.12')
-                self.assertTrue(saved['options']['fold_keyboard'])
+                self.assertEqual(saved['options']['leader_control_mode'], 'keyboard')
             finally:
                 app.closing = True
                 for timer in root.tk.splitlist(root.tk.call('after', 'info')):
@@ -413,6 +415,58 @@ class WorkbenchChecks(unittest.TestCase):
                 saved = json.loads(app.config_path.read_text())
                 self.assertEqual(saved['options']['leader'], 'ugv1')
                 self.assertIn('anchors_json', saved['options'])
+            finally:
+                app.closing = True
+                for timer in root.tk.splitlist(root.tk.call('after', 'info')):
+                    root.after_cancel(timer)
+                root.destroy()
+
+    def test_leader_popup_current_start_preview_and_pause_on_close(self):
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+        except tk.TclError:
+            self.skipTest('No desktop session')
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('fleet_console.connect_ssh', side_effect=AssertionError('Offline test')):
+            app = FleetConsole(root, Path(directory)/'settings.json')
+            wb = app.workbench
+            try:
+                app.vars['leader'].set('ugv3')
+                wb.active_leader, wb.active_identities = 'ugv3', {'192.168.0.109': 3}
+                wb.monitor = SimpleNamespace(ready=True, last=time.monotonic(), subscribers=1, enable=False,
+                                             enable_sequence=0, limits={'3': 0.15}, limit_status={},
+                                             drive=(0, 0, 0), tracking={'state': 'STOPPED', 'mode': 'keyboard'},
+                                             control_request={'sequence': 0, 'action': 'keyboard'})
+                wb.last_sample = time.monotonic()
+                wb.samples = {'3': {'pose': {'value': [2.1, 2.2], 'age': 0}, 'valid': {'value': True, 'age': 0}}}
+                app.notebook.select(2)
+                wb.open_leader_control()
+                root.update()
+                radios = [w for frame in wb.control_dialog.winfo_children() for w in frame.winfo_children()
+                          if w.winfo_class() == 'TRadiobutton']
+                radios[1].invoke()
+                self.assertEqual(wb.monitor.control_request['action'], 'path')
+                wb.use_current_start()
+                points = wb.preview_path()
+                self.assertEqual(points[0], (2.1, 2.2))
+                self.assertTrue(wb.canvas.find_withtag('reference_path'))
+                wb.trajectory_action('start')
+                self.assertEqual(wb.monitor.control_request['action'], 'start')
+                self.assertEqual(wb.monitor.control_request['points'], points)
+                self.assertEqual(wb.monitor.drive[:2], (0, 0))
+                wb.close_control_dialog()
+                self.assertEqual(wb.monitor.control_request['action'], 'pause')
+                self.assertIsNone(wb.keyboard)
+                wb.open_leader_control()
+                self.assertEqual(wb.monitor.control_request['action'], 'pause')  # Opening never starts motion.
+                app.save()
+                options, _ = load_settings(app.config_path)
+                self.assertEqual(options['leader_control_mode'], 'path')
+                self.assertIn('2.1000, 2.2000', options['leader_path'])
+                app.vars['leader'].set('ugv2')
+                wb.poll()
+                self.assertEqual(wb.monitor.control_request['action'], 'stop')
             finally:
                 app.closing = True
                 for timer in root.tk.splitlist(root.tk.call('after', 'info')):

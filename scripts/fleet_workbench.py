@@ -17,6 +17,7 @@ import yaml
 from fleet_deploy import (read_robot_config, robot_number, run_remote, shell_path,
                           update_config)
 from fleet_terminal import Terminal
+from leader_tracker import parse_points, check_bounds
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCALIZATION = ROOT / 'src/five_ugv_uwb_localization'
@@ -24,11 +25,34 @@ DEFAULTS = {
     'leader': 'ugv1', 'formation_selected': '192.168.0.106,192.168.0.108,192.168.0.109,192.168.0.110,192.168.0.114',
     'anchors_json': '',
     'linear_limit': '',
-    'active_tab': '0', 'formation_step': '0', 'fold_keyboard': True, 'fold_logs': True,
+    'leader_control_mode': 'keyboard', 'leader_path': '2.0, 2.2\n3.0, 2.2\n3.0, 2.8',
+    'path_speed': '0.10', 'path_lookahead': '0.40',
+    'active_tab': '0', 'formation_step': '0', 'fold_logs': True,
 }
 COLORS = ['#1976d2', '#e76622', '#009688', '#9b51b6', '#c0395a', '#8a7600']
 KEY_DIRECTIONS = {'w': (1, 0), 'up': (1, 0), 's': (-1, 0), 'down': (-1, 0),
                   'a': (0, 1), 'left': (0, 1), 'd': (0, -1), 'right': (0, -1)}
+TRACKING_TEXT = {
+    'IDLE': '待命', 'STOPPED': '已停止', 'TRACKING': '路径跟踪中', 'ALIGNING': '正在对齐方向',
+    'PAUSED': '已暂停', 'DONE': '已到达终点', 'USER_PAUSE': '点击继续可恢复',
+    'UWB_INVALID': '领航定位无效', 'STALE_INPUT': '定位或里程计数据过期',
+    'WAIT_ALIGNMENT': '请保持领航车静止，等待航向对齐', 'FOLLOWER_INVALID': '跟随车定位无效或过期',
+    'FORMATION_OFFSETS': '缺少跟随车编队偏移，请重新连接监视', 'LIMIT_PENDING': '等待限速回读确认',
+    'NO_CHASSIS': '领航底盘没有接收速度指令', 'CONTROL_TIMEOUT': '控制连接超时，请手动继续',
+    'INVALID_POSE': '位姿无效', 'POSE_JUMP': '检测到位置跳变，请检查定位后继续',
+    'ZERO_LIMIT': '线速度上限为零', 'PATH_ERROR': '偏离当前路径超过 0.6 m，请检查定位或手动移回',
+    'PATH_POINTS': '请填写 2–50 个坐标点，每行两个有限数值 X, Y',
+    'PATH_SEGMENT_SHORT': '相邻路径点距离至少 0.15 m',
+    'PATH_OUTSIDE': '路径超出基站范围或没有足够的车体 / 编队转弯余量',
+    'PATH_SETTINGS': '巡航速度需在 0–0.5 m/s（不含 0），预瞄距离需在 0.3–0.5 m',
+    'START_TOO_FAR': '路径起点距领航车超过 0.5 m，请使用当前位置或先手动移至起点',
+    'NO_PAUSED_PATH': '没有可继续的路径，请点击开始',
+}
+
+
+def path_bounds(config):
+    return [config['workspace_x_min'], config['workspace_y_min'],
+            config['workspace_x_max'], config['workspace_y_max']]
 
 
 def saved_linear_limit(options):
@@ -118,6 +142,8 @@ class Monitor:
         self.subscribers = 0
         self.limits = limits or {}
         self.limit_status = {}
+        self.control_request = {'sequence': 0, 'action': 'keyboard'}
+        self.tracking = {}
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
@@ -154,6 +180,7 @@ class Monitor:
                             self.ready, self.last, self.tick = True, now, data['tick']
                             self.subscribers = data['leader_subscribers']
                             self.limit_status = data.get('linear_limits', {})
+                            self.tracking = data.get('tracking', {})
                             self.events.put(('sample', data))
                 if channel.exit_status_ready() and not channel.recv_ready():
                     raise RuntimeError('监视进程退出：' + recent)
@@ -165,7 +192,7 @@ class Monitor:
                         linear = angular = 0.0
                     payload = dict(tick=self.tick, linear=linear, angular=angular,
                                    enable_sequence=self.enable_sequence, enable=self.enable,
-                                   linear_limits=self.limits)
+                                   linear_limits=self.limits, control=self.control_request)
                     channel.sendall((json.dumps(payload) + '\n').encode())
                     sent = now
                 self.stop.wait(0.02)
@@ -200,6 +227,9 @@ class FleetWorkbench:
         self.terminals = []
         self.monitor = None
         self.active_identities = {}
+        self.active_offsets = {}
+        self.control_dialog = self.keyboard = None
+        self.path_preview, self.tracking = [], {}
         self.keys_down, self.key_releases = set(), {}
         self.keyboard_direction = None
         self.run_id = uuid.uuid4().hex
@@ -211,6 +241,7 @@ class FleetWorkbench:
         self.armed = self.tk.BooleanVar(value=False)
         self.status = self.tk.StringVar(value='选择车辆，然后总启动或按步骤启动；双击车辆打开 SSH 终端。')
         self.keyboard_status = self.tk.StringVar(value='连接实时监视后，点击键盘控制区启用。')
+        self.leader_status = self.tk.StringVar(value='点击“领航控制”选择键盘或参考路径。')
         page = self.ttk.Frame(app.notebook, padding=10)
         app.notebook.add(page, text='编队算法')
         toolbar = self.ttk.Frame(page)
@@ -443,7 +474,7 @@ class FleetWorkbench:
             # mkdir through SSH handles missing parent cache directories.
         run_remote(client, 'mkdir -p ' + shlex.quote(remote), self.cancel, timeout=10)
         with client.open_sftp() as sftp:
-            for name in ('fleet_ros.py', 'fleet_bridge.py'):
+            for name in ('fleet_ros.py', 'fleet_bridge.py', 'leader_tracker.py'):
                 sftp.put(str(Path(__file__).with_name(name)), remote + '/' + name)
             for name in ('ugv.launch', 'ugv_deploy.launch'):
                 source = (LOCALIZATION / 'launch' / name).read_text()
@@ -468,6 +499,7 @@ class FleetWorkbench:
 
     def run_start(self, step, options, rows, config):
         clients, remotes, results, launched = {}, {}, {}, {}
+        offsets = {}
         current = options['master_ip']
         try:
             for session in list(self.app.sessions.values()):
@@ -493,6 +525,9 @@ class FleetWorkbench:
                                       ROS_MASTER_URI='http://%s:11311' % options['master_ip'], ROS_IP=ip, CAR_MODE='mini_4wd')
                         values.update(rows[ip].get('formation_config', {}))
                         existing = update_config(client, values)
+                    if rows[ip]['robot_id'] != options['leader']:
+                        offsets[str(robot_number(rows[ip]['robot_id']))] = [float(existing.get('offset_x', -0.8)),
+                                                                           float(existing.get('offset_y', 0.8))]
                     self.events.put(('config', ip, existing))
                 remote = remotes[ip] = self.stage(client, config)
                 results[ip] = '配置已检查'
@@ -551,11 +586,12 @@ class FleetWorkbench:
                 else:
                     identities = {ip: robot_number(row['robot_id']) for ip, row in rows.items()}
                     limits = session_limits(options, identities)
-                    command = ros_command(options, master, 'python -u %s/fleet_ros.py monitor --ids %s --leader %d --linear-limits %s' %
+                    command = ros_command(options, master, 'python -u %s/fleet_ros.py monitor --ids %s --leader %d --linear-limits %s --offsets %s --bounds=%s' %
                                           (shlex.quote(remotes[master]), ','.join(map(str, ids)), robot_number(options['leader']),
-                                           shlex.quote(json.dumps(limits))))
+                                           shlex.quote(json.dumps(limits)), shlex.quote(json.dumps(offsets)),
+                                           ','.join(str(v) for v in path_bounds(config))))
                     self.monitor = Monitor(clients.pop(master), command, self.events, limits)
-                    self.events.put(('monitor_started', ids, options['leader'], identities))
+                    self.events.put(('monitor_started', ids, options['leader'], identities, offsets))
                     deadline = time.monotonic() + 20
                     while not self.monitor.ready:
                         if self.cancel.wait(0.1) or not self.monitor.thread.is_alive() or time.monotonic() > deadline:
@@ -608,6 +644,7 @@ class FleetWorkbench:
 
     def emergency(self):
         self.armed.set(False)
+        self.send_control('stop')
         if self.monitor:
             self.monitor.drive = (0, 0, time.monotonic())
             self.monitor.enable = False
@@ -636,11 +673,12 @@ class FleetWorkbench:
         self.status.set('正在停止本次启动的 ROS 终端和监视进程')
 
     def space_stop(self, _):
-        if self.armed.get() or self.root.focus_get() in (self.canvas, self.keyboard):
+        if self.armed.get() or str(self.root.tk.call('focus')) in (str(self.canvas), str(self.keyboard)):
             self.emergency()
 
     def focus_stop(self):
-        if self.root.winfo_exists() and self.root.focus_displayof() is None:
+        # Native Tk message boxes have no Python widget object to resolve.
+        if self.root.winfo_exists() and not self.root.tk.call('focus', '-displayof', self.root._w):
             self.armed.set(False)
 
     def arm_changed(self, *_):
@@ -668,6 +706,9 @@ class FleetWorkbench:
         if error:
             self.keyboard_status.set(error)
             return
+        if self.app.vars['leader_control_mode'].get() != 'keyboard':
+            return
+        self.send_control('keyboard')
         self.keyboard.focus_set()
         self.armed.set(True)
         self.update_keyboard(time.monotonic())
@@ -707,7 +748,7 @@ class FleetWorkbench:
     def update_keyboard(self, now):
         if not self.armed.get():
             return
-        if self.root.focus_get() is not self.keyboard or not self.keyboard.winfo_viewable():
+        if str(self.root.tk.call('focus')) != str(self.keyboard) or not self.keyboard.winfo_viewable():
             self.armed.set(False)
             return
         error = self.keyboard_connection_error(now)
@@ -807,6 +848,139 @@ class FleetWorkbench:
         except ValueError:
             self.app.messagebox.showerror('线速度约束', '请输入 0–0.5 m/s 的线速度上限')
 
+    def send_control(self, action, **values):
+        if self.monitor:
+            previous = getattr(self.monitor, 'control_request', {'sequence': 0})
+            self.monitor.drive = (0, 0, time.monotonic())
+            self.monitor.control_request = dict(values, sequence=previous['sequence']+1, action=action)
+
+    def close_control_dialog(self):
+        self.armed.set(False)
+        self.send_control('pause' if self.app.vars['leader_control_mode'].get() == 'path' else 'stop')
+        if self.control_dialog:
+            self.control_dialog.destroy()
+            self.control_dialog = self.keyboard = None
+
+    def open_leader_control(self):
+        if self.control_dialog and self.control_dialog.winfo_exists():
+            self.control_dialog.lift()
+            return
+        dialog = self.control_dialog = self.tk.Toplevel(self.root)
+        dialog.title('领航控制')
+        dialog.transient(self.root)
+        dialog.geometry('720x450')
+        dialog.protocol('WM_DELETE_WINDOW', self.close_control_dialog)
+        dialog.bind('<Escape>', lambda _: self.emergency())
+        top = self.ttk.Frame(dialog, padding=10)
+        top.pack(fill='x')
+        self.ttk.Label(top, text='领航车（第二页设置）：').pack(side='left')
+        self.ttk.Label(top, textvariable=self.app.vars['leader']).pack(side='left', padx=6)
+        keyboard = self.ttk.Frame(dialog, padding=12)
+        path = self.ttk.Frame(dialog, padding=12)
+        def switch(send=True):
+            self.armed.set(False)
+            mode = self.app.vars['leader_control_mode'].get()
+            keyboard.pack_forget()
+            path.pack_forget()
+            (path if mode == 'path' else keyboard).pack(fill='both', expand=True)
+            if send:
+                self.send_control(mode)
+        for text, value in [('键盘控制', 'keyboard'), ('参考路径', 'path')]:
+            self.ttk.Radiobutton(top, text=text, variable=self.app.vars['leader_control_mode'],
+                                 value=value, command=switch).pack(side='left', padx=10)
+        pad = self.ttk.Frame(keyboard)
+        pad.pack(fill='x', pady=8)
+        for label, key in [('线速度 m/s', 'linear'), ('角速度 rad/s', 'angular')]:
+            self.ttk.Label(pad, text=label).pack(side='left', padx=(4, 2))
+            self.ttk.Entry(pad, textvariable=self.app.vars[key], width=7).pack(side='left')
+        self.keyboard = self.ttk.Button(pad, text='点击启用 · WASD / 方向键', command=self.activate_keyboard, takefocus=True)
+        self.keyboard.pack(side='left', padx=8)
+        self.keyboard.bind('<KeyPress>', self.key_press)
+        self.keyboard.bind('<KeyRelease>', self.key_release)
+        self.keyboard.bind('<FocusOut>', lambda _: self.armed.set(False))
+        self.ttk.Label(keyboard, text='W / ↑ 前进；S / ↓ 后退；A / ← 左转；D / → 右转。\n按住行驶，松键停车；失焦后需重新启用。空格 / Esc 停车。').pack(anchor='w', pady=12)
+        self.ttk.Label(keyboard, textvariable=self.keyboard_status, wraplength=650).pack(fill='x')
+        self.ttk.Label(path, text='折线坐标（UWB 地图，单位米）：每行 X, Y，按顺序连接；至少两点。').pack(anchor='w')
+        self.path_editor = self.tk.Text(path, height=5, width=40)
+        self.path_editor.pack(fill='x', pady=5)
+        self.path_editor.insert('1.0', self.app.vars['leader_path'].get())
+        def remember(_=None):
+            if self.path_editor.edit_modified():
+                self.app.vars['leader_path'].set(self.path_editor.get('1.0', 'end-1c'))
+                self.path_editor.edit_modified(False)
+        self.path_editor.bind('<<Modified>>', remember)
+        fields = self.ttk.Frame(path)
+        fields.pack(fill='x', pady=5)
+        self.ttk.Button(fields, text='使用当前位置为起点', command=self.use_current_start).pack(side='left', padx=(0, 10))
+        for label, key in [('巡航 m/s', 'path_speed'), ('预瞄 m', 'path_lookahead')]:
+            self.ttk.Label(fields, text=label).pack(side='left', padx=(5, 3))
+            self.ttk.Entry(fields, textvariable=self.app.vars[key], width=7).pack(side='left')
+        self.ttk.Label(path, text='先预览再开始；预瞄 0.3–0.5 m，建议巡航 0.10 m/s。关闭弹窗会暂停。').pack(anchor='w', pady=4)
+        actions = self.ttk.Frame(path)
+        actions.pack(fill='x', pady=4)
+        self.ttk.Button(actions, text='预览路径', command=self.preview_path).pack(side='left', padx=(0, 8))
+        for label, action in [('开始', 'start'), ('暂停', 'pause'), ('继续', 'resume'), ('停止', 'stop')]:
+            self.ttk.Button(actions, text=label, command=lambda action=action: self.trajectory_action(action)).pack(side='left', padx=(0, 8))
+        self.ttk.Label(path, textvariable=self.leader_status, wraplength=650).pack(fill='x', pady=5)
+        self.ttk.Button(dialog, text='立即停车 / 禁用跟随', command=self.emergency).pack(side='bottom', pady=8)
+        switch(False)
+
+    def use_current_start(self):
+        try:
+            error = self.keyboard_connection_error(time.monotonic())
+            if error:
+                raise ValueError(error)
+            number = str(robot_number(self.app.vars['leader'].get()))
+            if not self.fresh(number, time.monotonic()):
+                raise ValueError('领航车定位无效或过期')
+            x, y = self.samples[number]['pose']['value']
+            lines = self.path_editor.get('1.0', 'end-1c').splitlines()
+            lines = ['%.4f, %.4f' % (x, y)] + lines[1:]
+            self.path_editor.delete('1.0', 'end')
+            self.path_editor.insert('1.0', '\n'.join(lines))
+            self.app.vars['leader_path'].set('\n'.join(lines))
+        except ValueError as error:
+            self.app.messagebox.showerror('当前位置', str(error), parent=self.control_dialog)
+
+    def preview_path(self):
+        try:
+            if self.monitor and self.monitor.ready and self.tracking.get('state') in ('TRACKING', 'ALIGNING'):
+                raise ValueError('请先暂停，再预览或开始新路径')
+            points = parse_points(self.path_editor.get('1.0', 'end-1c'))
+            config = localization_config(self.app.vars['anchors_json'].get())
+            offsets = list(self.active_offsets.values()) if self.monitor and self.monitor.enable else []
+            check_bounds(points, path_bounds(config), offsets)
+            self.path_preview = points
+            self.app.vars['leader_path'].set(self.path_editor.get('1.0', 'end-1c'))
+            self.app.save()
+            self.paint_map(time.monotonic())
+            return points
+        except ValueError as error:
+            self.app.messagebox.showerror('参考路径', TRACKING_TEXT.get(str(error), str(error)), parent=self.control_dialog)
+
+    def trajectory_action(self, action):
+        self.armed.set(False)
+        try:
+            error = self.keyboard_connection_error(time.monotonic())
+            if error:
+                raise ValueError(error)
+            if not getattr(self.monitor, 'tracking', {}):
+                raise ValueError('请重新连接实时监视以加载路径控制功能')
+            values = {}
+            if action == 'start':
+                points = self.preview_path()
+                if points is None:
+                    return
+                speed = float(self.app.vars['path_speed'].get())
+                lookahead = float(self.app.vars['path_lookahead'].get())
+                if not 0 < speed <= 0.5 or not 0.3 <= lookahead <= 0.5:
+                    raise ValueError('PATH_SETTINGS')
+                values = dict(points=points, speed=speed, lookahead=lookahead)
+            self.send_control(action, **values)
+            self.leader_status.set('正在发送领航控制指令…')
+        except ValueError as error:
+            self.app.messagebox.showerror('领航控制', TRACKING_TEXT.get(str(error), str(error)), parent=self.control_dialog)
+
     def make_map(self):
         page = self.ttk.Frame(self.app.notebook, padding=10)
         self.app.notebook.add(page, text='小车定位图')
@@ -816,19 +990,8 @@ class FleetWorkbench:
         self.ttk.Button(toolbar, text='编辑基站坐标 / 高度', command=self.edit_anchors).pack(side='left', padx=8)
         self.ttk.Button(toolbar, text='清空轨迹', command=self.clear_trails).pack(side='left')
         self.ttk.Button(toolbar, text='立即停车 / 禁用跟随', command=self.emergency).pack(side='right')
-        pad = self.fold(page, '键盘控制（仅发送给本次领航车）', 'fold_keyboard')
-        for label, key in [('线速度 m/s', 'linear'), ('角速度 rad/s', 'angular')]:
-            self.ttk.Label(pad, text=label).pack(side='left', padx=(4, 2))
-            self.ttk.Entry(pad, textvariable=self.app.vars[key], width=7).pack(side='left')
-        self.keyboard = self.ttk.Button(pad, text='点击启用键盘控制 · WASD / 方向键',
-                                         command=self.activate_keyboard, takefocus=True)
-        self.keyboard.pack(side='left', padx=8)
-        self.keyboard.bind('<KeyPress>', self.key_press)
-        self.keyboard.bind('<KeyRelease>', self.key_release)
-        self.keyboard.bind('<FocusOut>', lambda _: self.armed.set(False))
-        self.ttk.Button(pad, text='停车 / 禁用跟随（空格 / Esc）', command=self.emergency).pack(side='left')
-        self.ttk.Label(page, text='W / ↑ 前进；S / ↓ 后退；A / ← 左转；D / → 右转。按住行驶，松键停车；离开控制区后需重新点击启用。').pack(anchor='w')
-        self.ttk.Label(page, textvariable=self.keyboard_status).pack(anchor='w')
+        self.ttk.Button(toolbar, text='领航控制…', command=self.open_leader_control).pack(side='left', padx=8)
+        self.ttk.Label(page, textvariable=self.leader_status, wraplength=1080).pack(fill='x', pady=4)
         limits = self.ttk.Frame(page)
         limits.pack(fill='x', pady=5)
         self.ttk.Label(limits, text='全车线速度上限 m/s').pack(side='left', padx=(4, 5))
@@ -836,13 +999,13 @@ class FleetWorkbench:
         self.ttk.Spinbox(limits, from_=0, to=0.5, increment=0.01, width=7,
                          textvariable=self.limit_input).pack(side='left')
         self.ttk.Button(limits, text='应用到全部', command=self.apply_limits).pack(side='left', padx=8)
-        self.ttk.Label(limits, text='0–0.5；0 仅停止平移').pack(side='left')
+        self.ttk.Label(limits, text='0–0.5；0 时路径暂停').pack(side='left')
         self.limits_status = self.tk.StringVar()
         self.ttk.Label(limits, textvariable=self.limits_status, wraplength=430).pack(side='left', padx=10)
         self.refresh_limits()
         self.map_status = self.tk.StringVar(value='尚未连接。基站坐标读取自 final_localization.yaml；单位：米。')
         self.ttk.Label(page, textvariable=self.map_status, wraplength=1080).pack(fill='x', pady=7)
-        self.ttk.Label(page, text='三角形：基站　圆点：车辆　实线：实际轨迹　虚线：目标轨迹 / 误差　灰色：定位过期或无效').pack(anchor='w')
+        self.ttk.Label(page, text='三角形：基站　圆点：车辆　实线：实际轨迹　虚线：目标 / 误差　紫色虚线：参考路径　灰色：定位过期或无效').pack(anchor='w')
         self.canvas = self.tk.Canvas(page, background='#f7fafc', highlightthickness=0, takefocus=True)
         self.canvas.pack(fill='both', expand=True)
         self.canvas.bind('<Button-1>', lambda _: self.canvas.focus_set())
@@ -935,6 +1098,8 @@ class FleetWorkbench:
         config = localization_config(self.app.vars['anchors_json'].get())
         anchors = config['anchors']
         points = [(a['x'], a['y']) for a in anchors]
+        path = self.tracking.get('points', []) if self.tracking.get('state') in ('TRACKING', 'ALIGNING') else self.path_preview
+        points.extend(path)
         for row in self.samples.values():
             for key in ('pose', 'target'):
                 if key in row:
@@ -961,6 +1126,15 @@ class FleetWorkbench:
             x, y = xy((a['x'], a['y']))
             canvas.create_polygon(x, y - 8, x - 7, y + 6, x + 7, y + 6, fill='#334155')
             canvas.create_text(x, y - 20, text='A%s · z=%.2f' % (a['id'], a['z']), fill='#334155')
+        if len(path) > 1:
+            canvas.create_line(*[v for point in path for v in xy(point)], fill='#7c3aed', width=2, dash=(8, 4), tags='reference_path')
+            for index, point in enumerate(path):
+                x, y = xy(point)
+                canvas.create_text(x+5, y-10, text='P%d' % index, fill='#7c3aed', anchor='w')
+        lookahead = self.tracking.get('target')
+        if lookahead and now-self.last_sample < 0.6 and self.tracking.get('mode') == 'path':
+            x, y = xy(lookahead)
+            canvas.create_oval(x-5, y-5, x+5, y+5, outline='#7c3aed', width=2)
         metrics = []
         for index, number in enumerate(sorted(self.samples, key=int)):
             row = self.samples[number]
@@ -989,6 +1163,8 @@ class FleetWorkbench:
             heading = row.get('yaw')
             if heading and heading['age'] + now - self.last_sample < 0.6:
                 angle = heading['value'] - self.yaw_origin.setdefault(number, heading['value'])
+                if 'ugv'+number == getattr(self, 'active_leader', '') and self.tracking.get('yaw') is not None:
+                    angle = self.tracking['yaw']
                 canvas.create_line(x, y, x + 23 * math.cos(angle), y - 23 * math.sin(angle), fill=color, width=2, arrow='last')
             canvas.create_text(x + 10, y + 17, text='ugv' + number + ('' if valid else ' 过期/无效'), fill=color, anchor='w')
             error = row.get('error', {})
@@ -1004,7 +1180,7 @@ class FleetWorkbench:
         self.map_status.set('%s · 基站 %d 个 · 标签高度 %.2f m · %s' %
                             ('实时监视已连接' if online else '实时监视未连接 / 数据过期', len(anchors), config['tag_height'],
                              '自定义基站（新启动定位时生效）' if self.app.vars['anchors_json'].get() else '代码默认基站'))
-        self.metrics.set('\n'.join(metrics) if metrics else '三角形：基站　圆点：车辆　十字：目标　虚线：误差　灰色：过期/无效；航向以连接时朝向 +X 为参考。')
+        self.metrics.set('\n'.join(metrics) if metrics else '暂无实时误差数据。领航航向对齐到 UWB 地图；跟随车航向以连接时的朝向为 +X 参考。')
 
     def poll(self):
         if self.monitor:
@@ -1017,6 +1193,9 @@ class FleetWorkbench:
             kind = event[0]
             if kind == 'sample':
                 self.samples = event[1]['robots']
+                self.tracking = event[1].get('tracking', {})
+                if 'offsets' in self.tracking:
+                    self.active_offsets = self.tracking['offsets']
                 self.last_sample = time.monotonic()
                 for number, row in self.samples.items():
                     if self.fresh(number, self.last_sample):
@@ -1040,13 +1219,15 @@ class FleetWorkbench:
                         self.enable_ack = marker
                         message = 'ROS 已发送：' + ('使能编队跟随' if sent else '禁用跟随')
                         if self.monitor.enable and not sent:
-                            message = '使能被拒绝：线速度上限未确认，请检查第三页后重新使能'
+                            message = '跟随未使能：请检查连接和限速状态后重新使能'
                             self.status.set(message)
                         self.append_log(message)
             elif kind == 'monitor_started':
                 self.current_ids = event[1]
                 self.active_leader = event[2]
                 self.active_identities = event[3]
+                self.active_offsets = event[4]
+                self.tracking = {}
                 self.samples.clear()
                 self.clear_trails()
                 self.yaw_origin.clear()
@@ -1072,6 +1253,28 @@ class FleetWorkbench:
             elif kind == 'log':
                 self.append_log(event[1])
         now = time.monotonic()
+        if self.monitor and self.app.vars['leader'].get().strip() != getattr(self, 'active_leader', ''):
+            if getattr(self.monitor, 'control_request', {}).get('action') != 'stop':
+                self.emergency()
+        if self.tracking.get('mode') == 'path' or (self.tracking.get('mode') == 'stopped' and self.tracking.get('points')):
+            state = self.tracking.get('state', 'IDLE')
+            reason = self.tracking.get('error') or self.tracking.get('reason') or self.tracking.get('input_problem', '')
+            detail = TRACKING_TEXT.get(reason, reason)
+            message = '%s · %s · %.2f / %.2f m · 横向误差 %.3f m%s' % (
+                getattr(self, 'active_leader', ''), TRACKING_TEXT.get(state, state),
+                self.tracking.get('progress', 0), self.tracking.get('total', 0),
+                self.tracking.get('cross_track', 0), ' · '+detail if detail else '')
+            if now-self.last_sample > 0.6:
+                message = '领航遥测已过期；检查连接，恢复后需点击继续'
+            self.leader_status.set(message)
+            marker = (state, reason, self.tracking.get('ack'))
+            if marker != getattr(self, 'tracking_marker', None):
+                self.tracking_marker = marker
+                self.append_log(message)
+        elif self.app.vars['leader_control_mode'].get() == 'path':
+            self.leader_status.set('参考路径待命；连接实时监视后预览并开始。')
+        else:
+            self.leader_status.set(self.keyboard_status.get())
         self.update_keyboard(now)
         if now - self.last_status > 1:
             for step, ip, terminal in list(self.terminals):

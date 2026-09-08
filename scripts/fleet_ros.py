@@ -13,6 +13,7 @@ import threading
 import time
 
 from fleet_bridge import monotonic, velocity
+from leader_tracker import LeaderTracker, TrackingLog, check_bounds, finite, wrap, validate_points
 
 
 def emit(data):
@@ -56,7 +57,10 @@ def check_serial():
 
 def yaw(orientation):
     q = orientation
-    return math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+    norm = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w
+    if not finite(norm) or norm < 1e-12:
+        return float('nan')
+    return math.atan2(2 * (q.w * q.z + q.x * q.y), norm - 2 * (q.y * q.y + q.z * q.z))
 
 
 def parse_limits(encoded, ids):
@@ -78,6 +82,8 @@ def main():
     parser.add_argument('--leader', type=int, default=0)
     parser.add_argument('--step', choices=['chassis', 'follower'], default='chassis')
     parser.add_argument('--linear-limits', default='')
+    parser.add_argument('--offsets', default='{}')
+    parser.add_argument('--bounds', default='')
     parser.add_argument('--timeout', type=float, default=45)
     args = parser.parse_args()
     ids = [int(value) for value in args.ids.split(',')]
@@ -131,6 +137,18 @@ def main():
     limits = parse_limits(args.linear_limits, ids) if args.linear_limits else {str(n): 0.15 for n in ids}
     limit_publishers, limit_subscribers = {}, {}
     last_limit_publish = -1e9
+    offsets = json.loads(args.offsets)
+    for number, point in offsets.items():
+        if str(number) not in limits or len(point) != 2 or not all(finite(float(v)) for v in point):
+            raise ValueError('Invalid formation offsets')
+    bounds = [float(v) for v in args.bounds.split(',')] if args.bounds else None
+    if bounds and (len(bounds) != 4 or not all(finite(v) for v in bounds) or
+                   bounds[0] >= bounds[2] or bounds[1] >= bounds[3]):
+        raise ValueError('Invalid path bounds')
+    tracker, tracking_log = LeaderTracker(), None
+    log_directory = ''
+    control_mode, last_control, control_error = 'keyboard', -1, ''
+    alignment = {'offset': None, 'stationary_since': None}
 
     def record(number, key, convert):
         def callback(message):
@@ -153,9 +171,12 @@ def main():
     for number in ids:
         prefix = '/ugv%d/' % number
         fields = [('uwb/pose', PoseStamped, 'pose', position),
+                  ('uwb/pose', PoseStamped, 'fusion_yaw', lambda m: yaw(m.pose.orientation)),
                   ('uwb/valid', Bool, 'valid', lambda m: m.data),
                   ('uwb/status', String, 'uwb_status', lambda m: m.data),
                   ('odom_combined', PoseWithCovarianceStamped, 'yaw', lambda m: yaw(m.pose.pose.orientation)),
+                  ('odom', Odometry, 'velocity', lambda m: [m.twist.twist.linear.x, m.twist.twist.linear.y,
+                                                          m.twist.twist.angular.z]),
                   ('formation_controller/target_pose', PoseStamped, 'target', position),
                   ('formation_controller/tracking_error', Vector3Stamped, 'error', lambda m: m.vector.z),
                   ('formation_controller/state', String, 'state', lambda m: m.data)]
@@ -184,7 +205,65 @@ def main():
                                        'ready': connected and applied == requested}
             return result
 
+    def control_pose(now):
+        with lock:
+            row = dict(cache.get(str(args.leader), {}))
+        if not row.get('valid', (False, 0))[0]:
+            alignment['stationary_since'] = None
+            return None, 'UWB_INVALID'
+        if any(now-row.get(key, (None, -1e9))[1] > 0.5
+               for key in ('pose', 'valid', 'yaw', 'fusion_yaw', 'velocity')):
+            alignment['stationary_since'] = None
+            return None, 'STALE_INPUT'
+        if alignment['offset'] is None:
+            vx, vy, omega = row['velocity'][0]
+            if math.hypot(vx, vy) > 0.02 or abs(omega) > 0.03:
+                alignment['stationary_since'] = None
+            elif alignment['stationary_since'] is None:
+                alignment['stationary_since'] = now
+            elif now-alignment['stationary_since'] >= 0.4:
+                # Anchor odom heading to the EKF's UWB frame once while stationary.
+                alignment['offset'] = wrap(row['fusion_yaw'][0]-row['yaw'][0])
+            if alignment['offset'] is None:
+                return None, 'WAIT_ALIGNMENT'
+        return list(row['pose'][0]) + [wrap(row['yaw'][0]+alignment['offset'])], ''
+
+    def formation_problem(now):
+        if not enable_sent:
+            return ''
+        for number in ids:
+            if number == args.leader:
+                continue
+            if str(number) not in offsets:
+                return 'FORMATION_OFFSETS'
+            with lock:
+                row = dict(cache.get(str(number), {}))
+            if (not row.get('valid', (False, 0))[0] or
+                    any(now-row.get(key, (None, -1e9))[1] > 0.5 for key in ('pose', 'valid'))):
+                return 'FOLLOWER_INVALID'
+        if not all(row['ready'] for row in limit_status().values()):
+            return 'LIMIT_PENDING'
+        return ''
+
+    def read_offsets():
+        for number in ids:
+            if number == args.leader:
+                continue
+            default = offsets.get(str(number), [None, None])
+            actual = [float(rospy.get_param('/ugv%d/formation_controller/offset_%s' % (number, axis), default[i]))
+                      for i, axis in enumerate(('x', 'y'))]
+            if not all(finite(v) for v in actual):
+                raise ValueError('FORMATION_OFFSETS')
+            offsets[str(number)] = actual
+
+    # Capture launch parameters before entering the velocity loop; RPCs must not
+    # block the 20 Hz output. Offset changes require reconnecting the monitor.
+    try:
+        read_offsets()
+    except (ValueError, TypeError):
+        pass  # Missing offsets prevent formation path control below.
     last_input, command, buffer, last_enable = monotonic(), {}, '', None
+    last_heartbeat, last_sample = -1e9, -1e9
     enable_sent = False
     enable.publish(False)
     emit({'event': 'ready'})
@@ -207,6 +286,8 @@ def main():
                     last_input = monotonic()
                     tick = command.get('tick', 0)
                     fresh = isinstance(tick, (int, float)) and 0 <= monotonic() - tick <= 0.4
+                    if fresh:
+                        last_heartbeat = monotonic()
                     if fresh and 'linear_limits' in command:
                         updated = parse_limits(command['linear_limits'], ids)
                         if updated != limits:
@@ -214,10 +295,75 @@ def main():
                     sequence = command.get('enable_sequence')
                     if fresh and sequence is not None and sequence != last_enable:
                         ready = all(row['ready'] for row in limit_status().values())
+                        if ready and command.get('enable'):
+                            try:
+                                if control_mode == 'path' and tracker.points:
+                                    check_bounds(tracker.points, bounds, list(offsets.values()))
+                            except (ValueError, TypeError) as error:
+                                ready = False
+                                if tracker.state in tracker.ACTIVE:
+                                    tracker.pause(str(error))
                         enable_sent = bool(command.get('enable')) and ready
                         enable.publish(enable_sent)
                         last_enable = sequence
+                    request = command.get('control', {})
+                    sequence = request.get('sequence', -1)
+                    if not fresh and isinstance(sequence, int) and sequence > last_control:
+                        last_control, control_error = sequence, 'CONTROL_TIMEOUT'
+                        if request.get('action') in ('start', 'resume', 'path'):
+                            control_mode = 'path'
+                        if tracker.state in tracker.ACTIVE:
+                            tracker.pause(control_error)
+                    if fresh and isinstance(sequence, int) and sequence > last_control:
+                        last_control, control_error = sequence, ''
+                        action = request.get('action')
+                        try:
+                            if action in ('keyboard', 'path', 'stop'):
+                                tracker.stop()
+                                control_mode = 'stopped' if action == 'stop' else action
+                            elif action == 'pause':
+                                if tracker.state in tracker.ACTIVE or tracker.state == 'PAUSED':
+                                    tracker.pause()
+                                control_mode = 'path'
+                            elif action in ('start', 'resume'):
+                                control_mode = 'path'
+                                if action == 'start':
+                                    tracker.pause()
+                                elif tracker.state != 'PAUSED':
+                                    raise ValueError('NO_PAUSED_PATH')
+                                pose, problem = control_pose(monotonic())
+                                problem = problem or formation_problem(monotonic())
+                                if publishers[args.leader].get_num_connections() < 1:
+                                    problem = 'NO_CHASSIS'
+                                if problem:
+                                    raise ValueError(problem)
+                                if action == 'start':
+                                    points = request.get('points', [])
+                                    points = validate_points(points)
+                                    check_bounds(points, bounds, list(offsets.values()) if enable_sent else [])
+                                    tracker.start(points, float(request.get('speed', 0.1)),
+                                                  float(request.get('lookahead', 0.4)), pose, monotonic())
+                                    if tracking_log:
+                                        tracking_log.close()
+                                        tracking_log = None
+                                    root = os.path.join(os.environ.get('FORMATION_WS', os.getcwd()), 'logs', 'leader_tracking')
+                                    tracking_log = TrackingLog(root, dict(request, leader=args.leader,
+                                                                         offsets=offsets, bounds=bounds,
+                                                                         yaw_offset=alignment['offset']), monotonic())
+                                    log_directory = tracking_log.directory
+                                else:
+                                    tracker.resume(monotonic())
+                            else:
+                                raise ValueError('CONTROL_ACTION')
+                        except (ValueError, TypeError, OSError) as error:
+                            if tracker.state in tracker.ACTIVE:
+                                tracker.pause(str(error))
+                            else:
+                                tracker.reason = str(error)
+                            control_mode, control_error = 'path', str(error)
                     if fresh and command.get('stop'):
+                        tracker.stop()
+                        control_mode = 'stopped'
                         enable_sent = False
                         enable.publish(False)
                         for publisher in publishers.values():
@@ -230,23 +376,58 @@ def main():
                     publisher.publish(Float64(data=limits[str(number)]))
                 last_limit_publish = now
             linear, angular = velocity(command, now)
+            pose, problem = control_pose(now)
+            if now-last_heartbeat > 0.4:
+                if tracker.state in tracker.ACTIVE:
+                    tracker.pause('CONTROL_TIMEOUT')
+                if enable_sent:
+                    enable_sent = False
+                    enable.publish(False)
+            if control_mode == 'path':
+                problem = problem or formation_problem(now)
+                if not problem and enable_sent and tracker.points:
+                    try:
+                        check_bounds(tracker.points, bounds, list(offsets.values()))
+                    except ValueError as error:
+                        problem = str(error)
+                if publishers[args.leader].get_num_connections() < 1:
+                    problem = 'NO_CHASSIS'
+                if problem and tracker.state in tracker.ACTIVE:
+                    tracker.pause(problem)
+                following = [(float(offsets[str(n)][0]), float(offsets[str(n)][1]), limits[str(n)])
+                             for n in ids if n != args.leader and str(n) in offsets] if enable_sent else []
+                linear, angular = tracker.step(pose, now, limits[str(args.leader)], following)
+            elif control_mode == 'stopped':
+                linear = angular = 0.0
             linear = max(-limits[str(args.leader)], min(limits[str(args.leader)], linear))
             twist = Twist()
             twist.linear.x, twist.angular.z = linear, angular
             publishers[args.leader].publish(twist)
+            if tracking_log:
+                tracking_log.record(now, pose, tracker, limits[str(args.leader)], (linear, angular))
+                if control_mode != 'path' or tracker.state in ('DONE', 'STOPPED'):
+                    tracking_log.close()
+                    tracking_log = None
             with lock:
                 robots = {number: {key: {'value': value, 'age': now - at}
                                    for key, (value, at) in values.items()} for number, values in cache.items()}
-            emit({'event': 'sample', 'tick': now, 'robots': robots,
-                  'enable_sequence': last_enable, 'enable_sent': enable_sent,
-                  'linear_limits': limit_status(), 'leader_subscribers': publishers[args.leader].get_num_connections()})
-            time.sleep(max(0, 0.1 - (monotonic() - started)))
+            if now-last_sample >= 0.1:
+                emit({'event': 'sample', 'tick': now, 'robots': robots,
+                      'enable_sequence': last_enable, 'enable_sent': enable_sent,
+                      'tracking': dict(tracker.status(), mode=control_mode, ack=last_control, error=control_error,
+                                       yaw=pose[2] if pose else None, input_problem=problem, offsets=offsets,
+                                       log_directory=log_directory),
+                      'linear_limits': limit_status(), 'leader_subscribers': publishers[args.leader].get_num_connections()})
+                last_sample = now
+            time.sleep(max(0, 0.05 - (monotonic() - started)))
     finally:
         for _ in range(3):
             enable.publish(False)
             for publisher in publishers.values():
                 publisher.publish(Twist())
             time.sleep(0.05)
+        if tracking_log:
+            tracking_log.close()
 
 
 if __name__ == '__main__':
