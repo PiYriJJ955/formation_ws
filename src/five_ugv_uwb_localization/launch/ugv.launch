@@ -1,6 +1,7 @@
 <launch>
   <arg name="ugv_id" default="$(optenv UGV_ID 1)"/>
   <arg name="start_chassis" default="true"/>
+  <arg name="localization_config" default="$(find five_ugv_uwb_localization)/config/final_localization.yaml"/>
   <arg name="car_mode" default="$(optenv CAR_MODE mini_4wd)"/>
   <arg name="port_name" default="$(optenv UWB_PORT /dev/ttyCH343USB2)"/>
   <arg name="baud_rate" default="921600"/>
@@ -15,6 +16,7 @@
     </include>
   </group>
   <include file="$(find five_ugv_uwb_localization)/launch/ugv_deploy.launch">
+    <arg name="localization_config" value="$(arg localization_config)"/>
     <arg name="ugv_id" value="$(arg ugv_id)"/>
     <arg name="port_name" value="$(arg port_name)"/>
     <arg name="baud_rate" value="$(arg baud_rate)"/>

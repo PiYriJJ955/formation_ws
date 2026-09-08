@@ -9,44 +9,46 @@ anchors:
   - {id: 5, x: 3.2, y: 4.4, z: 1.35}
   - {id: 3, x: 0.0, y: 4.4, z: 1.35}
 
+# Planar base pose; tag height and body-frame lever arm are fixed measurements.
+tag_offset_xy: [0.0, 0.0]
+initial_uwb_yaw: 0.0
+calibration_file: "~/.config/formation/uwb_calibration.yaml"
+range_biases: {}
+range_stddevs: {}
+gyro_bias_z: 0.0
 min_anchors: 4
-range_timeout: 0.12
 min_valid_range: 1.05
 max_valid_range: 20.0
 
-range_sigma: 0.10
-huber_delta: 0.25
-max_iterations: 10
-convergence_tolerance: 0.0001
-max_gn_step: 1.0
-
-jump_threshold: 0.40
-jump_max_rate: 1.0
-jump_reset_time: 0.50
-
-loo_trigger_rms: 0.30
-loo_min_absolute_improvement: 0.08
-loo_max_rms_ratio: 0.75
-
-# Alpha at the reference input rate; adjusted using actual sample intervals.
-position_lpf_alpha: 0.35
-position_lpf_reference_rate: 50.0
+# Fixed standard deviations; robust weights only limit individual innovations.
+range_sigma: 0.20
+position_process_noise: 0.025
+yaw_process_noise: 0.015
+wheel_speed_stddev: 0.03
+gyro_stddev: 0.025
+systematic_position_stddev: 0.10
+max_position_stddev: 0.35
+innovation_gate_sigma: 3.0
+innovation_huber_sigma: 1.5
+link_bad_frames: 3
+link_recovery_frames: 15
+link_recovery_step: 0.05
+initialization_frames: 8
+initialization_spread: 0.15
+valid_recovery_frames: 3
+valid_max_residual_rms: 0.35
+max_geometry_condition: 20.0
+max_position_correction: 0.06
 
 workspace_x_min: 0.0
 workspace_x_max: 6.4
 workspace_y_min: 0.0
 workspace_y_max: 4.4
 workspace_margin: 0.80
-
-max_position_jump: 0.35
-position_jump_reset_time: 0.50
-
-valid_max_residual_rms: 0.35
 input_watchdog_timeout: 0.20
-# Receive continuously; solve only the latest pending frame.
+motion_timeout: 0.15
 solve_rate: 20.0
 max_measurement_age: 0.15
 path_min_distance: 0.03
-# Visualization history is bounded; 0 Hz disables path collection/publication.
 path_publish_rate: 2.0
 path_max_points: 1000

@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 from __future__ import print_function
+import copy
+import json
 import math
+import os
 import threading
 from collections import deque
 try:
@@ -24,334 +27,221 @@ except ImportError:
         return value.tv_sec + value.tv_nsec*1e-9
 import numpy as np
 import rospy
-from geometry_msgs.msg import PoseStamped, PointStamped
-from nav_msgs.msg import Path
-from std_msgs.msg import Bool, Float64, Int32, Int32MultiArray
+import yaml
+from geometry_msgs.msg import PoseStamped, PointStamped, PoseWithCovarianceStamped
+from nav_msgs.msg import Path, Odometry
+from sensor_msgs.msg import Imu
+from std_msgs.msg import Bool, Float64, Int32, Int32MultiArray, String
 from nlink_parser.msg import LinktrackNodeframe2
+from robust_range_ekf import RangeEKF, FrameClock, predict_motion
+
 
 class RobustUWBLocalizer(object):
     def __init__(self):
-        self.input_topic = rospy.get_param("~input_topic")
-        self.world_frame = rospy.get_param("~world_frame", "uwb_map")
-        self.tag_z = float(rospy.get_param("~tag_height", 0.25))
-
-        self.anchors = {}
-        self.order = []
-        for a in rospy.get_param("~anchors", []):
-            aid = int(a["id"])
-            self.anchors[aid] = np.array([float(a["x"]), float(a["y"]), float(a["z"])], dtype=float)
-            self.order.append(aid)
-
-        self.min_anchors = int(rospy.get_param("~min_anchors", 4))
-        self.range_timeout = float(rospy.get_param("~range_timeout", 0.12))
-        self.min_range = float(rospy.get_param("~min_valid_range", 1.05))
-        self.max_range = float(rospy.get_param("~max_valid_range", 20.0))
-        self.sigma = float(rospy.get_param("~range_sigma", 0.10))
-        self.huber_delta = float(rospy.get_param("~huber_delta", 0.25))
-        self.max_iter = int(rospy.get_param("~max_iterations", 10))
-        self.tol = float(rospy.get_param("~convergence_tolerance", 1e-4))
-        self.max_step = float(rospy.get_param("~max_gn_step", 1.0))
-
-        self.jump_threshold = float(rospy.get_param("~jump_threshold", 0.40))
-        self.jump_max_rate = float(rospy.get_param("~jump_max_rate", 1.0))
-        self.jump_reset_time = float(rospy.get_param("~jump_reset_time", 0.50))
-
-        self.loo_trigger = float(rospy.get_param("~loo_trigger_rms", 0.30))
-        self.loo_abs = float(rospy.get_param("~loo_min_absolute_improvement", 0.08))
-        self.loo_ratio = float(rospy.get_param("~loo_max_rms_ratio", 0.75))
-
-        self.alpha = float(rospy.get_param("~position_lpf_alpha", 0.35))
-        self.lpf_reference_rate = float(rospy.get_param("~position_lpf_reference_rate", 50.0))
-        self.xmin = float(rospy.get_param("~workspace_x_min", 0.0))
-        self.xmax = float(rospy.get_param("~workspace_x_max", 6.4))
-        self.ymin = float(rospy.get_param("~workspace_y_min", 0.0))
-        self.ymax = float(rospy.get_param("~workspace_y_max", 4.4))
-        self.margin = float(rospy.get_param("~workspace_margin", 0.8))
-
-        self.max_position_jump = float(rospy.get_param("~max_position_jump", 0.35))
-        self.position_jump_reset_time = float(rospy.get_param("~position_jump_reset_time", 0.50))
-        self.valid_max_rms = float(rospy.get_param("~valid_max_residual_rms", 0.35))
-        self.watchdog_timeout = float(rospy.get_param("~input_watchdog_timeout", 0.20))
-        self.solve_rate = float(rospy.get_param("~solve_rate", 20.0))
-        self.max_measurement_age = float(rospy.get_param("~max_measurement_age", 0.15))
-        self.path_min_distance = float(rospy.get_param("~path_min_distance", 0.03))
-        self.path_publish_rate = float(rospy.get_param("~path_publish_rate", 2.0))
-        self.path_max_points = int(rospy.get_param("~path_max_points", 1000))
-
-        for name in ("solve_rate", "max_measurement_age", "lpf_reference_rate",
-                     "watchdog_timeout", "range_timeout"):
-            value = getattr(self, name)
-            if not self.finite(value) or value <= 0.0:
+        self.config = rospy.get_param("~", {})
+        calibration = os.path.expanduser(self.config.get("calibration_file", "~/.config/formation/uwb_calibration.yaml"))
+        if os.path.isfile(calibration):
+            with open(calibration) as stream:
+                calibrated = yaml.safe_load(stream) or {}
+            for key in ("range_biases", "range_stddevs", "tag_offset_xy", "gyro_bias_z"):
+                if key in calibrated:
+                    self.config[key] = calibrated[key]
+            rospy.loginfo("Loaded fixed UWB calibration: %s", calibration)
+        self.ekf = RangeEKF(self.config)
+        self.world_frame = self.config.get("world_frame", "uwb_map")
+        for name, default in (("solve_rate", 20.0), ("max_measurement_age", 0.15),
+                              ("input_watchdog_timeout", 0.20), ("motion_timeout", 0.15)):
+            value = float(self.config.get(name, default))
+            if not np.isfinite(value) or value <= 0:
                 raise ValueError("%s must be finite and positive" % name)
-        if not 0.0 <= self.alpha <= 1.0:
-            raise ValueError("position_lpf_alpha must be between 0 and 1")
-        if not self.finite(self.path_publish_rate) or self.path_publish_rate < 0.0:
-            raise ValueError("path_publish_rate must be finite and nonnegative")
-        if self.path_max_points < 1:
-            raise ValueError("path_max_points must be positive")
-
-        self.input_lock = threading.Lock()
-        self.output_lock = threading.Lock()
+            setattr(self, name, value)
+        self.watchdog_timeout = self.input_watchdog_timeout
+        self.path_min_distance = float(self.config.get("path_min_distance", 0.03))
+        self.path_publish_rate = float(self.config.get("path_publish_rate", 2.0))
+        self.path_max_points = int(self.config.get("path_max_points", 1000))
+        if not np.isfinite(self.path_publish_rate) or self.path_publish_rate < 0 or self.path_max_points < 1:
+            raise ValueError("Invalid path settings")
+        self.clock = FrameClock()
+        self.input_lock, self.output_lock = threading.Lock(), threading.Lock()
         self.latest_frame = None
         self.dropped_frames = 0
-        self.meas = {}
-        self.last_good_range = {}
-        self.raw_solution = None
-        self.filtered = None
-        self.last_valid_time = None
-        self.last_input_time = None
-        self.last_path_xy = None
+        self.motion = {"odom": deque(maxlen=500), "imu": deque(maxlen=500)}
+        self.last_input_time = self.last_valid_time = self.filter_time = self.last_update_time = None
+        self.good_updates = 0
+        self.recovery_frames = int(self.config.get("valid_recovery_frames", 3))
+        if self.recovery_frames < 1:
+            raise ValueError("valid_recovery_frames must be positive")
+        self.last_path_xy = self.last_path_publish_time = None
         self.path_poses = deque(maxlen=self.path_max_points)
-        self.last_path_publish_time = None
         self.path_dirty = False
-
-        self.pose_pub = rospy.Publisher("uwb/pose", PoseStamped, queue_size=1)
-        self.point_pub = rospy.Publisher("uwb/point", PointStamped, queue_size=1)
-        self.path_pub = rospy.Publisher("uwb/path", Path, queue_size=1, latch=True)
-        self.valid_pub = rospy.Publisher("uwb/valid", Bool, queue_size=1, latch=True)
-        self.rms_pub = rospy.Publisher("uwb/residual_rms", Float64, queue_size=1)
-        self.full_rms_pub = rospy.Publisher("uwb/full_residual_rms", Float64, queue_size=1)
-        self.count_pub = rospy.Publisher("uwb/used_anchor_count", Int32, queue_size=1)
-        self.jump_pub = rospy.Publisher("uwb/jump_rejected_ids", Int32MultiArray, queue_size=1)
-        self.loo_pub = rospy.Publisher("uwb/loo_excluded_id", Int32, queue_size=1)
-        self.age_pub = rospy.Publisher("uwb/measurement_age", Float64, queue_size=1)
-        self.processing_pub = rospy.Publisher("uwb/processing_time", Float64, queue_size=1)
-        self.dropped_pub = rospy.Publisher("uwb/dropped_frame_count", Int32, queue_size=1)
-
+        for name, topic, kind, latch in (
+                ("pose", "pose", PoseStamped, False), ("point", "point", PointStamped, False),
+                ("covariance", "pose_covariance", PoseWithCovarianceStamped, False),
+                ("path", "path", Path, True), ("valid", "valid", Bool, True),
+                ("status", "status", String, True), ("diagnostics", "diagnostics", String, False),
+                ("rms", "residual_rms", Float64, False), ("full_rms", "full_residual_rms", Float64, False),
+                ("count", "used_anchor_count", Int32, False),
+                ("jump", "jump_rejected_ids", Int32MultiArray, False),
+                ("loo", "loo_excluded_id", Int32, False),
+                ("age", "measurement_age", Float64, False),
+                ("processing", "processing_time", Float64, False),
+                ("dropped", "dropped_frame_count", Int32, False)):
+            setattr(self, name + "_pub", rospy.Publisher("uwb/" + topic, kind, queue_size=1, latch=latch))
         self.publish_valid(False)
-        self.input_sub = rospy.Subscriber(self.input_topic, LinktrackNodeframe2, self.cb,
-                                          queue_size=1, buff_size=2**20)
+        self.status_pub.publish(String(data="INITIALIZING"))
+        # Save effective parameters (including per-car calibration) for the logger.
+        rospy.set_param("~effective_config", self.config)
+        rospy.Subscriber("odom", Odometry, self.motion_cb, "odom", queue_size=1)
+        rospy.Subscriber("imu", Imu, self.motion_cb, "imu", queue_size=1)
+        rospy.Subscriber(self.config["input_topic"], LinktrackNodeframe2, self.cb,
+                         queue_size=1, buff_size=2**20)
         self.solve_timer = rospy.Timer(rospy.Duration(1.0/self.solve_rate), self.process_cb)
         self.watchdog_timer = rospy.Timer(rospy.Duration(0.05), self.watchdog_cb)
-        rospy.loginfo("Algorithm-B UWB localizer started in %s", rospy.get_namespace())
-        rospy.loginfo("Input: %s", rospy.resolve_name(self.input_topic))
-        rospy.loginfo("Latest-frame solving at %.1f Hz; maximum measurement age %.3f s",
-                      self.solve_rate, self.max_measurement_age)
+        rospy.loginfo("Robust range EKF started in %s; keep stationary facing UWB yaw %.3f during initialization",
+                      rospy.get_namespace(), self.ekf.initial_yaw)
 
-    def finite(self, v):
-        return not (math.isnan(v) or math.isinf(v))
-
-    def physical_valid(self, aid, r):
-        if not self.finite(r) or r < self.min_range or r > self.max_range:
-            return False
-        dz = abs(self.tag_z - self.anchors[aid][2])
-        return not (r + 0.05 < dz)
+    def motion_cb(self, msg, kind):
+        now, received = rospy.Time.now().to_sec(), monotonic()
+        stamp = msg.header.stamp.to_sec()
+        values = ((msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.angular.z)
+                  if kind == "odom" else (msg.angular_velocity.z,))
+        if (not np.all(np.isfinite(values)) or not 0 <= now-stamp <= self.motion_timeout or
+                max(abs(v) for v in values) > 3.0):
+            return
+        with self.input_lock:
+            history = self.motion[kind]
+            sample_time = received - (now-stamp)
+            if not history or sample_time > history[-1][0]:
+                history.append((sample_time, values))
 
     def cb(self, msg):
-        # Keep reception independent of WLS/LOO and message serialization.
-        # ponytail: receipt time only; upstream latency needs a driver timestamp.
         with self.input_lock:
-            stamp, received_at = rospy.Time.now(), monotonic()
+            received, stamp = monotonic(), rospy.Time.now()
+            timing = self.clock.accept(msg.local_time, received)
+            if timing is None:
+                self.dropped_frames += 1
+                return
+            measured, reset = timing
             if self.latest_frame is not None:
                 self.dropped_frames += 1
-            self.latest_frame = (msg, stamp, received_at)
-            self.last_input_time = received_at
+            self.latest_frame = (msg, stamp, received, measured, reset)
+            self.last_input_time = received
 
     def process_cb(self, _event):
-        # One Timer owns all range/solver/filter/path state. Never hold this
-        # lock during computation: incoming frames must be able to replace it.
         with self.input_lock:
-            frame = self.latest_frame
-            self.latest_frame = None
+            frame, self.latest_frame = self.latest_frame, None
+            motion = {k: list(v) for k, v in self.motion.items()}
         if frame is None:
             return
-
-        msg, stamp, received_at = frame
+        msg, received_stamp, received, measured, reset = frame
         started = monotonic()
+        result = {"valid": False, "status": "STALE_INPUT", "accepted_ids": [], "rejected_ids": []}
+        candidate = None
         try:
-            if started - received_at > self.max_measurement_age:
+            if started-measured <= self.max_measurement_age:
+                candidate = copy.deepcopy(self.ekf)
+                result = {"valid": False, "status": "MOTION_STALE", "accepted_ids": [], "rejected_ids": []}
+                # A lost motion interval cannot be reconstructed from a later velocity.
+                start = measured if self.filter_time is None else self.filter_time
+                fresh = predict_motion(candidate, start, measured, motion, self.motion_timeout)
+                if reset or not fresh:
+                    # Preserve the established world heading; require a node restart if
+                    # a motion gap means the robot could have rotated while unobserved.
+                    if self.ekf.x is not None:
+                        result["status"] = "RESTART_REQUIRED"
+                        candidate = None
+
+                    else:
+                        candidate.candidates.clear()
+                elif getattr(self, "motion_fault", False):
+                    result["status"] = "RESTART_REQUIRED"
+                    candidate = None
+                else:
+                    # Bootstrap must be stationary. Initial yaw is the known launch heading.
+                    velocity = next((v for t, v in reversed(motion["odom"]) if t <= measured), (9, 9, 9))
+                    if candidate.x is None and max(abs(v) for v in velocity) > 0.02:
+                        candidate.candidates.clear()
+                        result["status"] = "WAIT_STATIONARY"
+                    else:
+                        measurements = {}
+                        duplicate = False
+                        for n in msg.nodes:
+                            if int(n.id) in measurements:
+                                duplicate = True
+                            measurements[int(n.id)] = float(n.dis)
+                        if duplicate:
+                            result["status"] = "DUPLICATE_ANCHOR"
+                        else:
+                            result = candidate.update(measurements)
+            with self.output_lock:
+                finished = monotonic()
+                if finished-measured > self.max_measurement_age:
+                    candidate = None
+                    result.update(valid=False, status="STALE_INPUT")
+                if result["status"] == "RESTART_REQUIRED":
+                    self.motion_fault = True
+                self.last_update_time = measured
+                if candidate is not None:
+                    self.ekf, self.filter_time = candidate, measured
+                if result["valid"]:
+                    self.good_updates += 1
+                    if self.good_updates < self.recovery_frames:
+                        result.update(valid=False, status="RECOVERING")
+                else:
+                    self.good_updates = 0
+                stamp = received_stamp - rospy.Duration(max(0.0, received-measured))
+                result.update(stamp=stamp.to_sec(), receive_stamp=received_stamp.to_sec(),
+                              local_time=int(msg.local_time), system_time=int(msg.system_time),
+                              measurement_age=finished-measured, processing_time=finished-started,
+                              dropped_frames=self.dropped_frames,
+                              motion_ages={k: (measured-v[-1][0] if v else None) for k, v in motion.items()},
+                              position_stddev=(self.ekf.position_stddev() if self.ekf.x is not None else None),
+                              state=(self.ekf.x.tolist() if self.ekf.x is not None else None))
+                self.publish_result(result)
+                if result["valid"]:
+                    self.last_valid_time = measured
+                    self.publish_pose(stamp)
+        except (ValueError, ArithmeticError, np.linalg.LinAlgError) as error:
+            with self.output_lock:
+                self.good_updates = 0
                 self.publish_valid(False)
-                rospy.logwarn_throttle(1.0, "Skipping stale UWB input (age %.3f s)",
-                                       started - received_at)
-                return
-            self.process_ranges(msg, received_at)
-            self.solve(stamp, received_at)
-        finally:
-            finished = monotonic()
-            with self.input_lock:
-                dropped = self.dropped_frames
-            self.age_pub.publish(Float64(data=finished - received_at))
-            self.processing_pub.publish(Float64(data=finished - started))
-            self.dropped_pub.publish(Int32(data=dropped))
+                self.status_pub.publish(String(data="FILTER_ERROR"))
+            rospy.logerr_throttle(1.0, "UWB EKF: %s", error)
 
-    def process_ranges(self, msg, now):
-        jump_ids = []
+    def publish_result(self, result):
+        self.publish_valid(result["valid"])
+        self.status_pub.publish(String(data=result["status"]))
+        self.diagnostics_pub.publish(String(data=json.dumps(result, sort_keys=True, allow_nan=False)))
+        self.count_pub.publish(Int32(data=len(result.get("accepted_ids", []))))
+        self.jump_pub.publish(Int32MultiArray(data=result.get("rejected_ids", [])))
+        self.loo_pub.publish(Int32(data=-1))
+        for name, key in (("rms", "residual_rms"), ("full_rms", "full_residual_rms"),
+                          ("age", "measurement_age"), ("processing", "processing_time")):
+            value = result.get(key)
+            getattr(self, name + "_pub").publish(Float64(data=float("nan") if value is None else value))
+        self.dropped_pub.publish(Int32(data=self.dropped_frames))
 
-        for node in msg.nodes:
-            aid = int(node.id)
-            if aid not in self.anchors:
-                continue
-            r = float(node.dis)
-            if not self.physical_valid(aid, r):
-                continue
-
-            accept = True
-            if aid in self.last_good_range:
-                prev_r, prev_t = self.last_good_range[aid]
-                dt = now - prev_t
-                if dt <= self.jump_reset_time:
-                    allowed = self.jump_threshold + self.jump_max_rate * max(dt, 0.0)
-                    if abs(r - prev_r) > allowed:
-                        accept = False
-
-            if accept:
-                self.meas[aid] = {"id": aid, "range": r, "stamp": now, "anchor": self.anchors[aid]}
-                self.last_good_range[aid] = (r, now)
-            else:
-                jump_ids.append(aid)
-
-        m = Int32MultiArray()
-        m.data = jump_ids
-        self.jump_pub.publish(m)
-
-    def fresh(self, now):
-        data = []
-        for aid in self.order:
-            if aid in self.meas and 0.0 <= now - self.meas[aid]["stamp"] <= self.range_timeout:
-                data.append(self.meas[aid])
-        return data
-
-    def linear_ls(self, data):
-        ref = data[0]
-        r0 = ref["range"]
-        x0,y0,z0 = ref["anchor"]
-        A=[]; b=[]
-        for item in data[1:]:
-            ri=item["range"]; xi,yi,zi=item["anchor"]
-            A.append([2*(xi-x0),2*(yi-y0)])
-            b.append(r0*r0-ri*ri+xi*xi-x0*x0+yi*yi-y0*y0+(self.tag_z-zi)**2-(self.tag_z-z0)**2)
-        try:
-            x = np.linalg.lstsq(np.asarray(A), np.asarray(b), rcond=-1)[0]
-            return x if np.all(np.isfinite(x)) else None
-        except Exception:
-            return None
-
-    def huber(self, e):
-        a=abs(e)
-        if self.huber_delta <= 0 or a <= self.huber_delta:
-            return 1.0
-        return self.huber_delta/max(a,1e-9)
-
-    def wls(self, initial, data):
-        if len(data) < self.min_anchors:
-            return None, None
-        x=np.asarray(initial,dtype=float).copy()
-        for _ in range(self.max_iter):
-            H=[]; r=[]; w=[]
-            for item in data:
-                ax,ay,az=item["anchor"]
-                dx=x[0]-ax; dy=x[1]-ay; dz=self.tag_z-az
-                pred=max(math.sqrt(dx*dx+dy*dy+dz*dz),1e-6)
-                e=item["range"]-pred
-                H.append([dx/pred,dy/pred]); r.append(e)
-                w.append(self.huber(e)/max(self.sigma*self.sigma,1e-9))
-            H=np.asarray(H); r=np.asarray(r); W=np.diag(np.asarray(w))
-            normal=H.T.dot(W).dot(H); rhs=H.T.dot(W).dot(r)
-            try:
-                delta=np.linalg.solve(normal,rhs)
-            except Exception:
-                try:
-                    delta=np.linalg.lstsq(normal,rhs,rcond=-1)[0]
-                except Exception:
-                    return None,None
-            step=float(np.linalg.norm(delta))
-            if step > self.max_step:
-                delta *= self.max_step/max(step,1e-9)
-            x += delta
-            if float(np.linalg.norm(delta)) < self.tol:
-                break
-        return x,self.rms(x,data)
-
-    def rms(self, x, data):
-        errs=[]
-        for item in data:
-            ax,ay,az=item["anchor"]
-            pred=math.sqrt((x[0]-ax)**2+(x[1]-ay)**2+(self.tag_z-az)**2)
-            errs.append(item["range"]-pred)
-        return math.sqrt(sum(e*e for e in errs)/float(len(errs)))
-
-    def inside(self, x):
-        return self.xmin-self.margin <= x[0] <= self.xmax+self.margin and self.ymin-self.margin <= x[1] <= self.ymax+self.margin
-
-    def loo(self, base_x, base_rms, data):
-        if base_rms <= self.loo_trigger or len(data) <= self.min_anchors:
-            return base_x,base_rms,data,-1
-        best=None
-        for k in range(len(data)):
-            subset=data[:k]+data[k+1:]
-            cx,cr=self.wls(base_x,subset)
-            if cx is None or not self.inside(cx):
-                continue
-            if best is None or cr < best[1]:
-                best=(cx,cr,subset,data[k]["id"])
-        if best is None:
-            return base_x,base_rms,data,-1
-        if (base_rms-best[1] >= self.loo_abs and best[1]/max(base_rms,1e-9) <= self.loo_ratio):
-            return best
-        return base_x,base_rms,data,-1
-
-    def solve(self, stamp, received_at):
-        data=self.fresh(monotonic())
-        if len(data) < self.min_anchors:
-            self.publish_valid(False); return
-
-        init=self.raw_solution.copy() if self.raw_solution is not None else self.linear_ls(data)
-        if init is None:
-            self.publish_valid(False); return
-
-        bx,br=self.wls(init,data)
-        if bx is None or not self.inside(bx):
-            self.publish_valid(False); return
-
-        fx,fr,used,loo_id=self.loo(bx,br,data)
-        full_rms=self.rms(fx,data)
-
-        lm=Int32(); lm.data=int(loo_id); self.loo_pub.publish(lm)
-        cm=Int32(); cm.data=len(used); self.count_pub.publish(cm)
-        rm=Float64(); rm.data=float(fr); self.rms_pub.publish(rm)
-        fm=Float64(); fm.data=float(full_rms); self.full_rms_pub.publish(fm)
-
-        dt = None if self.last_valid_time is None else received_at - self.last_valid_time
-        if self.raw_solution is not None and dt is not None:
-            if dt <= self.position_jump_reset_time:
-                if float(np.linalg.norm(fx-self.raw_solution)) > self.max_position_jump:
-                    self.publish_valid(False); return
-
-        if fr > self.valid_max_rms:
-            self.publish_valid(False); return
-
-        # Do not commit an expired result, even if fresh inputs arrived while
-        # it was being computed. Serialize this check/publication with watchdog.
-        with self.output_lock:
-            finished = monotonic()
-            if (finished - received_at > self.max_measurement_age or
-                    any(finished - item["stamp"] > self.range_timeout for item in used)):
-                self.publish_valid(False)
-                rospy.logwarn_throttle(1.0, "Discarding expired UWB solution (age %.3f s)",
-                                       finished - received_at)
-                return
-            self.raw_solution = fx.copy()
-            alpha = self.filter_alpha(dt) if dt is not None else 1.0
-            self.filtered = fx.copy() if self.filtered is None else alpha*fx+(1-alpha)*self.filtered
-            self.last_valid_time = received_at
-
-            pose=PoseStamped()
-            pose.header.stamp=stamp; pose.header.frame_id=self.world_frame
-            pose.pose.position.x=float(self.filtered[0]); pose.pose.position.y=float(self.filtered[1]); pose.pose.position.z=self.tag_z
-            pose.pose.orientation.w=1.0
-            self.pose_pub.publish(pose)
-
-            pt=PointStamped(); pt.header=pose.header; pt.point=pose.pose.position; self.point_pub.publish(pt)
-            self.publish_valid(True)
-
+    def publish_pose(self, stamp):
+        x, y, yaw = self.ekf.x
+        pose = PoseStamped()
+        pose.header.stamp, pose.header.frame_id = stamp, self.world_frame
+        pose.pose.position.x, pose.pose.position.y = float(x), float(y)
+        pose.pose.position.z = self.ekf.tag_height
+        pose.pose.orientation.z, pose.pose.orientation.w = math.sin(yaw/2), math.cos(yaw/2)
+        self.pose_pub.publish(pose)
+        point = PointStamped(); point.header = pose.header; point.point = pose.pose.position
+        self.point_pub.publish(point)
+        covariance = PoseWithCovarianceStamped()
+        covariance.header, covariance.pose.pose = pose.header, pose.pose
+        for i, row in enumerate((0, 1, 5)):
+            for j, col in enumerate((0, 1, 5)):
+                covariance.pose.covariance[6*row+col] = float(self.ekf.P[i, j])
+        for i in (0, 7):
+            covariance.pose.covariance[i] += self.ekf.systematic_stddev**2
+        for i in (14, 21, 28):
+            covariance.pose.covariance[i] = 1e6
+        self.covariance_pub.publish(covariance)
         self.update_path(pose)
-
-        rospy.loginfo_throttle(0.5,"UWB pose x=%.3f y=%.3f valid=1 anchors=%d rms=%.3f loo=%d",
-                               self.filtered[0],self.filtered[1],len(used),fr,loo_id)
-
-    def filter_alpha(self, dt):
-        # Preserve the nominal filter time constant when frames are skipped.
-        return 1.0 - (1.0 - self.alpha)**(max(dt, 0.0)*self.lpf_reference_rate)
 
     def update_path(self, pose):
         if self.path_publish_rate == 0.0:
@@ -372,17 +262,19 @@ class RobustUWBLocalizer(object):
             self.path_dirty = False
 
     def publish_valid(self, value):
-        m=Bool(); m.data=bool(value); self.valid_pub.publish(m)
+        self.valid_pub.publish(Bool(data=bool(value)))
 
-    def watchdog_cb(self,_):
+    def watchdog_cb(self, _event):
         with self.output_lock:
-            with self.input_lock:
-                last_input = self.last_input_time
             now = monotonic()
-            if (last_input is None or now - last_input > self.watchdog_timeout or
-                    self.last_valid_time is None or
-                    now - self.last_valid_time > self.max_measurement_age):
+            if (self.last_valid_time is None or now-self.last_valid_time > self.max_measurement_age or
+                    self.last_input_time is None or now-self.last_input_time > self.watchdog_timeout):
+                if self.last_update_time is None or now-self.last_update_time > self.max_measurement_age:
+                    self.good_updates = 0
                 self.publish_valid(False)
+                self.status_pub.publish(String(data="RESTART_REQUIRED" if getattr(self, "motion_fault", False)
+                                              else "WAIT_VALID_INPUT"))
+
 
 if __name__ == "__main__":
     rospy.init_node("uwb_localizer")

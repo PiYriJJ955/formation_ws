@@ -7,6 +7,9 @@ import csv
 import math
 import os
 import time
+import json
+import threading
+import tempfile
 
 import rospy
 
@@ -14,33 +17,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Bool, Float64, Int32, Int32MultiArray
+from std_msgs.msg import Bool, Float64, Int32, Int32MultiArray, String
 from nlink_parser.msg import LinktrackNodeframe2
 
 
 class LocalUGVOfflineLogger(object):
-    """
-    Per-UGV offline logger.
-
-    Run one copy under each UGV namespace:
-      /ugv0/offline_logger
-      /ugv1/offline_logger
-      /ugv2/offline_logger
-
-    It records only THIS vehicle:
-      uwb/pose
-      uwb/valid
-      uwb/residual_rms
-      uwb/full_residual_rms
-      uwb/used_anchor_count
-      uwb/jump_rejected_ids
-      uwb/loo_excluded_id
-      nlink_linktrack_nodeframe2 raw ranges/RSSI
-
-    No real-time plotting.
-    Ctrl+C -> save CSV + generate PNG.
-    """
+    """Per-car streaming CSV/JSONL recorder; shutdown generates plots."""
 
     def __init__(self):
         self.ugv_id = int(rospy.get_param("~ugv_id", 0))
@@ -52,25 +37,37 @@ class LocalUGVOfflineLogger(object):
         )
         self.duration = float(rospy.get_param("~duration", 0.0))
 
-        self.anchor_order = [0, 4, 1, 2, 5, 3]
-        self.anchor_xy = {
-            0: (0.0, 0.0),
-            4: (3.2, 0.0),
-            1: (6.4, 0.0),
-            2: (6.4, 4.4),
-            5: (3.2, 4.4),
-            3: (0.0, 4.4)
+        anchors = rospy.get_param("~anchors", [])
+        if not anchors:
+            raise ValueError("Logger requires the localization anchor configuration")
+        self.anchor_order = [int(a["id"]) for a in anchors]
+        self.anchor_xy = {int(a["id"]): (a["x"], a["y"]) for a in anchors}
+        if not os.path.isdir(self.output_root):
+            os.makedirs(self.output_root)
+        self.output_dir = tempfile.mkdtemp(prefix="ugv%d_test_%s_" %
+                                          (self.ugv_id, time.strftime("%Y%m%d_%H%M%S")),
+                                          dir=self.output_root)
+        self.lock = threading.RLock()
+        self._finished = False
+        self.files, self.writers = {}, {}
+        self.columns = {
+            "localization": ["t", "x", "y", "valid", "residual_rms", "full_residual_rms",
+                             "used_anchor_count", "jump_rejected_ids", "loo_excluded_id", "stamp", "status"],
+            "raw_linktrack": (["t"] + ["range_id%d" % i for i in self.anchor_order] +
+                              ["fp_rssi_id%d" % i for i in self.anchor_order] +
+                              ["rx_rssi_id%d" % i for i in self.anchor_order] +
+                              ["receive_stamp", "local_time", "system_time"]),
+            "events": ["t", "event_type", "anchor_id"],
+            "odom": ["t", "receive_stamp", "stamp", "vx", "vy", "omega"],
+            "imu": ["t", "receive_stamp", "stamp", "gyro_z", "ax", "ay", "az"],
         }
-
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        self.output_dir = os.path.join(
-            self.output_root,
-            "ugv%d_test_%s" % (self.ugv_id, stamp)
-        )
-
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir)
-
+        for name, columns in self.columns.items():
+            self.files[name] = open(os.path.join(self.output_dir, name+".csv"), "w")
+            self.writers[name] = csv.writer(self.files[name])
+            self.writers[name].writerow(columns)
+        self.files["diagnostics"] = open(os.path.join(self.output_dir, "diagnostics.jsonl"), "w")
+        self.parameter_snapshot = False
+        self.flush(None)
         self.start = rospy.Time.now()
 
         self.latest_valid = False
@@ -84,55 +81,11 @@ class LocalUGVOfflineLogger(object):
         self.raw_rows = []
         self.event_rows = []
 
-        # Relative names: namespace automatically resolves to /ugvX/...
-        rospy.Subscriber(
-            "uwb/pose",
-            PoseStamped,
-            self.pose_cb,
-            queue_size=100
-        )
-        rospy.Subscriber(
-            "uwb/valid",
-            Bool,
-            self.valid_cb,
-            queue_size=100
-        )
-        rospy.Subscriber(
-            "uwb/residual_rms",
-            Float64,
-            self.rms_cb,
-            queue_size=100
-        )
-        rospy.Subscriber(
-            "uwb/full_residual_rms",
-            Float64,
-            self.full_rms_cb,
-            queue_size=100
-        )
-        rospy.Subscriber(
-            "uwb/used_anchor_count",
-            Int32,
-            self.count_cb,
-            queue_size=100
-        )
-        rospy.Subscriber(
-            "uwb/jump_rejected_ids",
-            Int32MultiArray,
-            self.jump_cb,
-            queue_size=100
-        )
-        rospy.Subscriber(
-            "uwb/loo_excluded_id",
-            Int32,
-            self.loo_cb,
-            queue_size=100
-        )
-        rospy.Subscriber(
-            "nlink_linktrack_nodeframe2",
-            LinktrackNodeframe2,
-            self.raw_cb,
-            queue_size=100
-        )
+        rospy.Subscriber("uwb/diagnostics", String, self.diagnostics_cb, queue_size=100)
+        rospy.Subscriber("nlink_linktrack_nodeframe2", LinktrackNodeframe2, self.raw_cb, queue_size=100)
+        rospy.Subscriber("odom", Odometry, self.motion_cb, "odom", queue_size=100)
+        rospy.Subscriber("imu", Imu, self.motion_cb, "imu", queue_size=100)
+        self.flush_timer = rospy.Timer(rospy.Duration(1.0), self.flush)
 
         rospy.on_shutdown(self.finish)
 
@@ -148,7 +101,7 @@ class LocalUGVOfflineLogger(object):
             self.ugv_id,
             self.output_dir
         )
-        rospy.loginfo("No real-time plotting. Ctrl+C to save and plot.")
+        rospy.loginfo("CSV/JSONL recording active; flush every second. Ctrl+C generates plots.")
 
     def t(self):
         return (rospy.Time.now() - self.start).to_sec()
@@ -162,54 +115,54 @@ class LocalUGVOfflineLogger(object):
         except Exception:
             return False
 
-    def valid_cb(self, msg):
-        self.latest_valid = bool(msg.data)
+    def flush(self, _event):
+        with self.lock:
+            if self._finished:
+                return
+            for stream in self.files.values():
+                stream.flush()
+                os.fsync(stream.fileno())
+            if not self.parameter_snapshot:
+                params = rospy.get_param("uwb_localizer/effective_config", None)
+                if params:
+                    with open(os.path.join(self.output_dir, "parameters.json"), "w") as stream:
+                        json.dump(params, stream, indent=2, sort_keys=True)
+                    self.parameter_snapshot = True
 
-    def rms_cb(self, msg):
-        self.latest_rms = float(msg.data)
+    def diagnostics_cb(self, msg):
+        # A single diagnostic frame keeps pose, validity, residual and IDs aligned.
+        data = json.loads(msg.data)
+        with self.lock:
+            if self._finished:
+                return
+            self.files["diagnostics"].write(msg.data+"\n")
+            state = data.get("state") or [float("nan"), float("nan")]
+            row = {"t": self.t(), "x": state[0], "y": state[1], "valid": int(data["valid"]),
+                   "rms": data.get("residual_rms"), "full_rms": data.get("full_residual_rms"),
+                   "count": len(data.get("accepted_ids", [])),
+                   "jump_ids": ",".join(str(i) for i in data.get("rejected_ids", [])), "loo_id": -1}
+            # Numeric CSV/plots retain NaN for missing residuals.
+            for key in ("rms", "full_rms"):
+                if row[key] is None:
+                    row[key] = float("nan")
+            self.pose_rows.append(row)
+            self.writers["localization"].writerow([row[k] for k in
+                ("t", "x", "y", "valid", "rms", "full_rms", "count", "jump_ids", "loo_id")] +
+                [data["stamp"], data["status"]])
+            for aid in data.get("rejected_ids", []):
+                self.event_rows.append({"t": row["t"], "type": "innovation", "anchor_id": aid})
+                self.writers["events"].writerow([row["t"], "innovation", aid])
 
-    def full_rms_cb(self, msg):
-        self.latest_full_rms = float(msg.data)
-
-    def count_cb(self, msg):
-        self.latest_count = int(msg.data)
-
-    def jump_cb(self, msg):
-        self.latest_jump_ids = [int(v) for v in msg.data]
-
-        if len(self.latest_jump_ids) > 0:
-            tt = self.t()
-            for aid in self.latest_jump_ids:
-                self.event_rows.append({
-                    "t": tt,
-                    "type": "jump",
-                    "anchor_id": aid
-                })
-
-    def loo_cb(self, msg):
-        self.latest_loo_id = int(msg.data)
-
-        if self.latest_loo_id >= 0:
-            self.event_rows.append({
-                "t": self.t(),
-                "type": "loo",
-                "anchor_id": self.latest_loo_id
-            })
-
-    def pose_cb(self, msg):
-        self.pose_rows.append({
-            "t": self.t(),
-            "x": float(msg.pose.position.x),
-            "y": float(msg.pose.position.y),
-            "valid": int(self.latest_valid),
-            "rms": self.latest_rms,
-            "full_rms": self.latest_full_rms,
-            "count": self.latest_count,
-            "jump_ids": ",".join(
-                [str(v) for v in self.latest_jump_ids]
-            ),
-            "loo_id": self.latest_loo_id
-        })
+    def motion_cb(self, msg, kind):
+        if kind == "odom":
+            v = msg.twist.twist
+            values = [v.linear.x, v.linear.y, v.angular.z]
+        else:
+            a = msg.linear_acceleration
+            values = [msg.angular_velocity.z, a.x, a.y, a.z]
+        with self.lock:
+            if not self._finished:
+                self.writers[kind].writerow([self.t(), rospy.Time.now().to_sec(), msg.header.stamp.to_sec()] + values)
 
     def raw_cb(self, msg):
         vals = {}
@@ -237,102 +190,13 @@ class LocalUGVOfflineLogger(object):
                 row["fp%d" % aid] = float("nan")
                 row["rx%d" % aid] = float("nan")
 
-        self.raw_rows.append(row)
-
-    def write_csvs(self):
-        pose_path = os.path.join(
-            self.output_dir,
-            "localization.csv"
-        )
-
-        with open(pose_path, "w") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "t",
-                "x",
-                "y",
-                "valid",
-                "residual_rms",
-                "full_residual_rms",
-                "used_anchor_count",
-                "jump_rejected_ids",
-                "loo_excluded_id"
-            ])
-
-            for r in self.pose_rows:
-                w.writerow([
-                    r["t"],
-                    r["x"],
-                    r["y"],
-                    r["valid"],
-                    r["rms"],
-                    r["full_rms"],
-                    r["count"],
-                    r["jump_ids"],
-                    r["loo_id"]
-                ])
-
-        raw_path = os.path.join(
-            self.output_dir,
-            "raw_linktrack.csv"
-        )
-
-        with open(raw_path, "w") as f:
-            w = csv.writer(f)
-
-            header = ["t"]
-            header += [
-                "range_id%d" % aid
-                for aid in self.anchor_order
-            ]
-            header += [
-                "fp_rssi_id%d" % aid
-                for aid in self.anchor_order
-            ]
-            header += [
-                "rx_rssi_id%d" % aid
-                for aid in self.anchor_order
-            ]
-
-            w.writerow(header)
-
-            for r in self.raw_rows:
-                out = [r["t"]]
-                out += [
-                    r["r%d" % aid]
-                    for aid in self.anchor_order
-                ]
-                out += [
-                    r["fp%d" % aid]
-                    for aid in self.anchor_order
-                ]
-                out += [
-                    r["rx%d" % aid]
-                    for aid in self.anchor_order
-                ]
-                w.writerow(out)
-
-        event_path = os.path.join(
-            self.output_dir,
-            "events.csv"
-        )
-
-        with open(event_path, "w") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "t",
-                "event_type",
-                "anchor_id"
-            ])
-
-            for r in self.event_rows:
-                w.writerow([
-                    r["t"],
-                    r["type"],
-                    r["anchor_id"]
-                ])
-
-        return pose_path, raw_path, event_path
+        with self.lock:
+            if self._finished:
+                return
+            self.raw_rows.append(row)
+            values = [row["t"]] + [row["%s%d" % (prefix, aid)]
+                                   for prefix in ("r", "fp", "rx") for aid in self.anchor_order]
+            self.writers["raw_linktrack"].writerow(values + [rospy.Time.now().to_sec(), msg.local_time, msg.system_time])
 
     def plot_trajectory(self):
         if len(self.pose_rows) < 2:
@@ -486,8 +350,8 @@ class LocalUGVOfflineLogger(object):
 
         plt.xlabel("Time [s]")
         plt.ylabel("Used anchors")
-        plt.ylim(0, 6.5)
-        plt.yticks(range(0, 7))
+        plt.ylim(0, len(self.anchor_order)+0.5)
+        plt.yticks(range(0, len(self.anchor_order)+1))
         plt.title(
             "UGV%d Used Anchor Count" % self.ugv_id
         )
@@ -524,7 +388,7 @@ class LocalUGVOfflineLogger(object):
         plt.ylabel("Anchor ID")
         plt.yticks(self.anchor_order)
         plt.title(
-            "UGV%d Jump / LOO Events" % self.ugv_id
+            "UGV%d Range Rejection Events" % self.ugv_id
         )
         plt.grid(True)
         plt.tight_layout()
@@ -649,12 +513,12 @@ class LocalUGVOfflineLogger(object):
             )
 
             for e in self.event_rows:
-                if e["type"] == "jump":
+                if e["type"] in ("jump", "innovation"):
                     jump_counts[e["anchor_id"]] += 1
                 elif e["type"] == "loo":
                     loo_counts[e["anchor_id"]] += 1
 
-            f.write("\nJump rejection counts:\n")
+            f.write("\nRange rejection counts:\n")
             for aid in self.anchor_order:
                 f.write(
                     "  ID%d: %d\n"
@@ -677,20 +541,18 @@ class LocalUGVOfflineLogger(object):
         return path
 
     def finish(self):
-        if getattr(self, "_finished", False):
-            return
-
-        self._finished = True
-
-        print("")
-        print(
-            "UGV%d offline logger stopping..."
-            % self.ugv_id
-        )
-
+        with self.lock:
+            if self._finished:
+                return
+            self.flush(None)
+            self._finished = True
+            for stream in self.files.values():
+                stream.close()
+        # Durable files are closed before plotting or printing to a terminal
+        # that may already have disconnected.
         try:
-            pose_path, raw_path, event_path = self.write_csvs()
-
+            pose_path, raw_path, event_path = [os.path.join(self.output_dir, name+".csv")
+                                               for name in ("localization", "raw_linktrack", "events")]
             self.plot_trajectory()
             self.plot_xy()
             self.plot_residual()

@@ -324,7 +324,7 @@ class FormationLogger(object):
         t = self.numbers(rows, "t")
 
         plt.figure(figsize=(8, 7))
-        for prefix, label in (("leader", "UGV0"),
+        for prefix, label in (("leader", self.leader_name),
                               ("follower", self.robot_name),
                               ("target", "target")):
             plt.plot(self.numbers(rows, prefix + "_x"),
@@ -334,7 +334,7 @@ class FormationLogger(object):
         self.save_plot(plt, "01_trajectories.png")
 
         fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
-        for prefix, label in (("leader", "UGV0"),
+        for prefix, label in (("leader", self.leader_name),
                               ("follower", self.robot_name),
                               ("target", "target")):
             axes[0].plot(t, self.numbers(rows, prefix + "_x"), label=label)
@@ -353,14 +353,14 @@ class FormationLogger(object):
         self.save_plot(plt, "03_tracking_error.png")
 
         fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
-        for name, label in (("leader_yaw", "UGV0 raw yaw"),
+        for name, label in (("leader_yaw", self.leader_name + " raw yaw"),
                             ("follower_yaw", self.robot_name + " raw yaw"),
                             ("target_yaw", "formation target yaw")):
             axes[0].plot(t, self.numbers(rows, name, 180.0/math.pi), label=label)
         axes[1].plot(t, self.numbers(rows, "heading_error", 180.0/math.pi),
                      label="controller heading error")
         axes[1].plot(t, self.numbers(rows, "heading_sync_error", 180.0/math.pi),
-                     label="UGV0 heading synchronization error")
+                     label=self.leader_name + " heading synchronization error")
         axes[0].set_ylabel("yaw [deg]"); axes[1].set_ylabel("error [deg]")
         axes[1].set_xlabel("time [s]"); axes[0].set_title("Heading")
         for axis in axes: axis.grid(True); axis.legend()
@@ -371,18 +371,18 @@ class FormationLogger(object):
             axes[0].plot(t, self.numbers(rows, name), label=name)
         axes[1].plot(t, self.numbers(rows, "desired_speed"), label="desired speed")
         axes[1].plot(t, self.numbers(rows, "leader_cmd_linear_x"),
-                     label="UGV0 cmd linear x")
+                     label=self.leader_name + " cmd linear x")
         axes[1].plot(t, self.numbers(rows, "leader_odom_vx"),
-                     label="UGV0 odom body vx")
+                     label=self.leader_name + " odom body vx")
         axes[1].plot(t, self.numbers(rows, "leader_odom_vy"),
-                     label="UGV0 odom body vy")
+                     label=self.leader_name + " odom body vy")
         axes[1].plot(t, self.numbers(rows, "cmd_linear_x"),
                      label=self.robot_name + " cmd linear x")
         axes[2].plot(t, self.numbers(rows, "leader_omega"), label="leader omega")
         axes[2].plot(t, self.numbers(rows, "leader_odom_omega"),
-                     label="UGV0 odom angular z")
+                     label=self.leader_name + " odom angular z")
         axes[2].plot(t, self.numbers(rows, "leader_cmd_angular_z"),
-                     label="UGV0 cmd angular z")
+                     label=self.leader_name + " cmd angular z")
         axes[2].plot(t, self.numbers(rows, "cmd_angular_z"),
                      label=self.robot_name + " cmd angular z")
         axes[0].set_ylabel("velocity [m/s]"); axes[1].set_ylabel("speed [m/s]")
@@ -392,10 +392,10 @@ class FormationLogger(object):
         self.save_plot(plt, "05_velocities.png")
 
         fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
-        axes[0].plot(t, self.numbers(rows, "leader_residual_rms"), label="UGV0")
+        axes[0].plot(t, self.numbers(rows, "leader_residual_rms"), label=self.leader_name)
         axes[0].plot(t, self.numbers(rows, "follower_residual_rms"),
                      label=self.robot_name)
-        axes[1].plot(t, self.numbers(rows, "leader_anchor_count"), label="UGV0")
+        axes[1].plot(t, self.numbers(rows, "leader_anchor_count"), label=self.leader_name)
         axes[1].plot(t, self.numbers(rows, "follower_anchor_count"),
                      label=self.robot_name)
         axes[0].set_ylabel("residual RMS [m]"); axes[1].set_ylabel("anchors")
@@ -404,7 +404,7 @@ class FormationLogger(object):
         self.save_plot(plt, "06_uwb_quality.png")
 
         fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
-        for name, label in (("enabled", "enabled"), ("leader_valid", "UGV0 valid"),
+        for name, label in (("enabled", "enabled"), ("leader_valid", self.leader_name + " valid"),
                             ("follower_valid", self.robot_name + " valid")):
             axes[0].step(t, self.numbers(rows, name), where="post", label=label)
         axes[0].set_ylim(-0.1, 1.1); axes[0].set_yticks([0, 1])

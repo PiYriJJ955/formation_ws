@@ -3,6 +3,9 @@
 from __future__ import print_function
 
 import os
+import tempfile
+
+import yaml
 
 import roslaunch
 
@@ -41,3 +44,13 @@ config = resolve('five_ugv_formation_control', 'follower.launch', ['ugv_id:=1', 
 assert config.params['/ugv1/formation_controller/leader_pose_topic'].value == '/ugv2/uwb/pose'
 assert config.params['/ugv1/formation_logger/leader_name'].value == 'ugv2'
 print('Fleet launch checks passed for ugv0, ugv1 and ugv2.')
+
+with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml') as custom:
+    anchors = [{'id': n, 'x': float(n % 2) * 8, 'y': float(n // 2) * 5, 'z': 1.6} for n in range(4)]
+    yaml.safe_dump({'anchors': anchors, 'tag_height': 0.33}, custom)
+    custom.flush()
+    config = resolve('five_ugv_uwb_localization', 'ugv.launch',
+                     ['ugv_id:=7', 'localization_config:=' + custom.name])
+    assert config.params['/ugv7/uwb_localizer/anchors'].value == anchors
+    assert config.params['/ugv7/uwb_localizer/tag_height'].value == 0.33
+print('Custom anchor config reaches the real localizer launch.')
