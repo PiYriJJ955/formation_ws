@@ -22,6 +22,10 @@
           type="robust_uwb_localizer.py"
           name="uwb_localizer"
           output="screen">
+      <!-- Tiny EKF matrices: threaded BLAS wastes CPU and delays callbacks on Jetson. -->
+      <env name="OPENBLAS_NUM_THREADS" value="1"/>
+      <env name="GOTO_NUM_THREADS" value="1"/>
+      <env name="OMP_NUM_THREADS" value="1"/>
       <rosparam command="load"
                 file="$(arg localization_config)"/>
       <param name="input_topic"
