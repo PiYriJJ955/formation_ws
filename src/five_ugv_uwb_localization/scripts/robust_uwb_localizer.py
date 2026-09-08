@@ -39,6 +39,7 @@ from robust_range_ekf import RangeEKF, FrameClock, predict_motion
 class RobustUWBLocalizer(object):
     def __init__(self):
         self.config = rospy.get_param("~", {})
+        self.config.pop("effective_config", None)  # A previous node may leave its snapshot on the master.
         calibration = os.path.expanduser(self.config.get("calibration_file", "~/.config/formation/uwb_calibration.yaml"))
         if os.path.isfile(calibration):
             with open(calibration) as stream:

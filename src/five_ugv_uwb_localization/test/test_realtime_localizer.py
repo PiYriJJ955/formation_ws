@@ -69,6 +69,11 @@ class RealtimeLocalizerTest(unittest.TestCase):
     def status(self):
         return self.node.status_pub.publish.call_args.args[0].data
 
+    def test_restart_parameter_snapshot_is_not_recursive(self):
+        self.params["effective_config"] = {"previous": True}
+        node = localizer.RobustUWBLocalizer()
+        self.assertNotIn("effective_config", node.config)
+
     def test_native_monotonic(self):
         source = ast.parse((PACKAGE / 'scripts/robust_uwb_localizer.py').read_text())
         clock = next(n for n in source.body if isinstance(n, ast.Try))
