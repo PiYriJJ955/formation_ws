@@ -231,7 +231,7 @@ class FleetWorkbench:
         self.control_dialog = self.keyboard = None
         self.path_preview, self.tracking = [], {}
         self.keys_down, self.key_releases = set(), {}
-        self.keyboard_direction = None
+        self.keyboard_keys = set()
         self.run_id = uuid.uuid4().hex
         self.samples, self.trails, self.last_pose, self.yaw_origin = {}, {}, {}, {}
         self.target_trails, self.error_history = {}, {}
@@ -687,7 +687,8 @@ class FleetWorkbench:
             self.keyboard_status.set('键盘已停用；点击控制区重新启用，再按方向键。')
 
     def stop_keyboard(self):
-        self.keyboard_direction = None
+        # Keep keys_down until release so a held key cannot re-arm after a stop.
+        self.keyboard_keys.clear()
         if self.monitor:
             self.monitor.drive = (0, 0, time.monotonic())
 
@@ -725,7 +726,7 @@ class FleetWorkbench:
             elif key not in self.keys_down:
                 self.keys_down.add(key)
                 if self.armed.get():
-                    self.keyboard_direction = key
+                    self.keyboard_keys.add(key)
                     self.update_keyboard(time.monotonic())
             return 'break'
 
@@ -740,8 +741,8 @@ class FleetWorkbench:
             def release():
                 self.key_releases.pop(key, None)
                 self.keys_down.discard(key)
-                if self.keyboard_direction == key:
-                    self.stop_keyboard()
+                self.keyboard_keys.discard(key)
+                self.update_keyboard(time.monotonic())
             self.key_releases[key] = self.root.after_idle(release)
             return 'break'
 
@@ -765,10 +766,12 @@ class FleetWorkbench:
             self.armed.set(False)
             self.keyboard_status.set('线速度需大于 0 且不超过 0.5 m/s，角速度需大于 0 且不超过 1.5 rad/s。')
             return
-        x, z = KEY_DIRECTIONS.get(self.keyboard_direction, (0, 0))
+        directions = {KEY_DIRECTIONS[key] for key in self.keyboard_keys}
+        x = int((1, 0) in directions) - int((-1, 0) in directions)
+        z = int((0, 1) in directions) - int((0, -1) in directions)
         linear = min(linear, self.monitor.limits[str(robot_number(self.active_leader))])
         self.monitor.drive = (x * linear, z * angular, now)
-        self.keyboard_status.set('键盘已启用 → %s · 输出 %.2f m/s，%.2f rad/s · 松键停车' %
+        self.keyboard_status.set('键盘已启用 → %s · 输出 %.2f m/s，%.2f rad/s · 全部松开停车' %
                                  (self.active_leader, x * linear, z * angular))
 
     def edit_vehicle(self):
@@ -898,7 +901,7 @@ class FleetWorkbench:
         self.keyboard.bind('<KeyPress>', self.key_press)
         self.keyboard.bind('<KeyRelease>', self.key_release)
         self.keyboard.bind('<FocusOut>', lambda _: self.armed.set(False))
-        self.ttk.Label(keyboard, text='W / ↑ 前进；S / ↓ 后退；A / ← 左转；D / → 右转。\n按住行驶，松键停车；失焦后需重新启用。空格 / Esc 停车。').pack(anchor='w', pady=12)
+        self.ttk.Label(keyboard, text='W / ↑ 前进；S / ↓ 后退；A / ← 左转；D / → 右转。\n可组合按键，例如 W+A 边前进边左转；松开一个键保留另一方向。\n同轴反向键抵消，全部松开停车；失焦后需重新启用。空格 / Esc 停车。').pack(anchor='w', pady=12)
         self.ttk.Label(keyboard, textvariable=self.keyboard_status, wraplength=650).pack(fill='x')
         self.ttk.Label(path, text='折线坐标（UWB 地图，单位米）：每行 X, Y，按顺序连接；至少两点。').pack(anchor='w')
         self.path_editor = self.tk.Text(path, height=5, width=40)

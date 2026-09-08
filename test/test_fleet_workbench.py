@@ -224,9 +224,45 @@ class WorkbenchChecks(unittest.TestCase):
                     release(key)
                     self.assertEqual(monitor.drive[:2], (0, 0))
                 self.assertIn('ugv3', wb.keyboard_status.get())
+                for travel, turn, expected in [('w', 'a', (0.1, 0.4)), ('w', 'd', (0.1, -0.4)),
+                                               ('s', 'a', (-0.1, 0.4)), ('s', 'd', (-0.1, -0.4)),
+                                               ('Up', 'Left', (0.1, 0.4)), ('Down', 'd', (-0.1, -0.4))]:
+                    for order in ((travel, turn), (turn, travel)):
+                        monitor.last = time.monotonic()
+                        press(order[0])
+                        press(order[1])
+                        self.assertEqual(monitor.drive[:2], expected, order)
+                        wb.keyboard.event_generate('<KeyRelease>', keysym=travel)
+                        press(travel)  # Autorepeat preserves the other held axis.
+                        root.update_idletasks()
+                        self.assertEqual(monitor.drive[:2], expected)
+                        release(travel)
+                        self.assertEqual(monitor.drive[:2], (0, expected[1]))
+                        press(travel)
+                        release(turn)
+                        self.assertEqual(monitor.drive[:2], (expected[0], 0))
+                        release(travel)
+                        self.assertEqual(monitor.drive[:2], (0, 0))
+                press('w')
+                press('Up')  # Equivalent keys do not double speed.
+                press('s')  # Opposite travel cancels even with two forward keys.
+                press('a')
+                self.assertEqual(monitor.drive[:2], (0, 0.4))
+                press('d')
+                self.assertEqual(monitor.drive[:2], (0, 0))
+                release('s')
+                self.assertEqual(monitor.drive[:2], (0.1, 0))
+                release('w')
+                self.assertEqual(monitor.drive[:2], (0.1, 0))
+                for key in ('Up', 'a', 'd'):
+                    release(key)
+                self.assertEqual(monitor.drive[:2], (0, 0))
                 monitor.limits['3'] = 0.06
                 press('w')
                 self.assertEqual(monitor.drive[:2], (0.06, 0))
+                press('a')
+                self.assertEqual(monitor.drive[:2], (0.06, 0.4))
+                release('a')
                 release('w')
                 press('s')
                 self.assertEqual(monitor.drive[:2], (-0.06, 0))
@@ -234,6 +270,9 @@ class WorkbenchChecks(unittest.TestCase):
                 monitor.limits['3'] = 0.0
                 press('w')
                 self.assertEqual(monitor.drive[:2], (0, 0))
+                press('d')
+                self.assertEqual(monitor.drive[:2], (0, -0.4))
+                release('d')
                 release('w')
                 monitor.limits['3'] = 0.15
                 press('w')
@@ -241,6 +280,8 @@ class WorkbenchChecks(unittest.TestCase):
                 press('w')  # X11 repeat pair keeps the current motion.
                 root.update_idletasks()
                 self.assertEqual(monitor.drive[:2], (0.1, 0))
+                press('a')
+                self.assertEqual(monitor.drive[:2], (0.1, 0.4))
                 press('space')
                 release('space')
                 self.assertFalse(wb.armed.get())
@@ -248,10 +289,12 @@ class WorkbenchChecks(unittest.TestCase):
                 self.assertEqual(monitor.drive[:2], (0, 0))
                 activate()
                 press('w')  # Held key cannot undo the emergency stop.
+                press('a')
                 self.assertEqual(monitor.drive[:2], (0, 0))
                 release('w')
                 press('w')
                 self.assertEqual(monitor.drive[:2], (0.1, 0))
+                release('a')
                 release('w')
                 press('a')
                 entry = next(w for w in wb.keyboard.master.winfo_children() if w.winfo_class() == 'TEntry')
