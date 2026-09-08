@@ -59,12 +59,25 @@ def yaw(orientation):
     return math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
 
 
+def parse_limits(encoded, ids):
+    data = json.loads(encoded) if isinstance(encoded, str) else encoded
+    if not isinstance(data, dict) or set(data) != set(str(n) for n in ids):
+        raise ValueError('Speed limits must contain exactly the participating robot IDs')
+    result = {}
+    for number, value in data.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 0.5:
+            raise ValueError('Speed limits must be finite numbers in [0, 0.5] m/s')
+        result[str(number)] = float(value)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=['master', 'check', 'wait', 'monitor'])
     parser.add_argument('--ids', default='0,1,2')
     parser.add_argument('--leader', type=int, default=0)
     parser.add_argument('--step', choices=['chassis', 'follower'], default='chassis')
+    parser.add_argument('--linear-limits', default='')
     parser.add_argument('--timeout', type=float, default=45)
     args = parser.parse_args()
     ids = [int(value) for value in args.ids.split(',')]
@@ -92,7 +105,7 @@ def main():
     import rospy
     from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist, Vector3Stamped
     from nav_msgs.msg import Odometry
-    from std_msgs.msg import Bool, String
+    from std_msgs.msg import Bool, String, Float64
     rospy.init_node('formation_console', anonymous=True, disable_signals=True)
     if args.mode == 'wait':
         deadline = monotonic() + args.timeout
@@ -115,6 +128,9 @@ def main():
     publishers = {number: rospy.Publisher('/ugv%d/cmd_vel' % number, Twist, queue_size=1) for number in ids}
     enable = rospy.Publisher('/five_ugv_formation/enable', Bool, queue_size=1, latch=True)
     subscribers = []
+    limits = parse_limits(args.linear_limits, ids) if args.linear_limits else {str(n): 0.15 for n in ids}
+    limit_publishers, limit_subscribers = {}, {}
+    last_limit_publish = -1e9
 
     def record(number, key, convert):
         def callback(message):
@@ -145,7 +161,31 @@ def main():
                   ('formation_controller/state', String, 'state', lambda m: m.data)]
         for topic, kind, key, convert in fields:
             subscribers.append(rospy.Subscriber(prefix + topic, kind, record(number, key, convert), queue_size=1))
+    for number in ids:
+        if number == args.leader:
+            continue
+        prefix = '/ugv%d/formation_controller/' % number
+        limit_publishers[number] = rospy.Publisher(prefix+'set_max_linear', Float64, queue_size=1, latch=True)
+        limit_subscribers[number] = rospy.Subscriber(prefix+'max_linear', Float64,
+                                                      record(number, 'max_linear', lambda m: m.data), queue_size=1)
+
+    def limit_status():
+        with lock:
+            result = {}
+            for number in ids:
+                requested = limits[str(number)]
+                if number == args.leader:
+                    applied, connected = requested, True
+                else:
+                    applied, at = cache.get(str(number), {}).get('max_linear', (None, 0))
+                    connected = (limit_publishers[number].get_num_connections() > 0 and
+                                 limit_subscribers[number].get_num_connections() > 0 and monotonic() - at < 2.0)
+                result[str(number)] = {'requested': requested, 'applied': applied,
+                                       'ready': connected and applied == requested}
+            return result
+
     last_input, command, buffer, last_enable = monotonic(), {}, '', None
+    enable_sent = False
     enable.publish(False)
     emit({'event': 'ready'})
     try:
@@ -167,18 +207,30 @@ def main():
                     last_input = monotonic()
                     tick = command.get('tick', 0)
                     fresh = isinstance(tick, (int, float)) and 0 <= monotonic() - tick <= 0.4
+                    if fresh and 'linear_limits' in command:
+                        updated = parse_limits(command['linear_limits'], ids)
+                        if updated != limits:
+                            limits, last_limit_publish = updated, -1e9
                     sequence = command.get('enable_sequence')
                     if fresh and sequence is not None and sequence != last_enable:
-                        enable.publish(bool(command.get('enable')))
+                        ready = all(row['ready'] for row in limit_status().values())
+                        enable_sent = bool(command.get('enable')) and ready
+                        enable.publish(enable_sent)
                         last_enable = sequence
                     if fresh and command.get('stop'):
+                        enable_sent = False
                         enable.publish(False)
                         for publisher in publishers.values():
                             publisher.publish(Twist())
             now = monotonic()
             if now - last_input > 3:
                 break
+            if now-last_limit_publish >= 1.0:
+                for number, publisher in limit_publishers.items():
+                    publisher.publish(Float64(data=limits[str(number)]))
+                last_limit_publish = now
             linear, angular = velocity(command, now)
+            linear = max(-limits[str(args.leader)], min(limits[str(args.leader)], linear))
             twist = Twist()
             twist.linear.x, twist.angular.z = linear, angular
             publishers[args.leader].publish(twist)
@@ -186,7 +238,8 @@ def main():
                 robots = {number: {key: {'value': value, 'age': now - at}
                                    for key, (value, at) in values.items()} for number, values in cache.items()}
             emit({'event': 'sample', 'tick': now, 'robots': robots,
-                  'enable_sequence': last_enable, 'leader_subscribers': publishers[args.leader].get_num_connections()})
+                  'enable_sequence': last_enable, 'enable_sent': enable_sent,
+                  'linear_limits': limit_status(), 'leader_subscribers': publishers[args.leader].get_num_connections()})
             time.sleep(max(0, 0.1 - (monotonic() - started)))
     finally:
         for _ in range(3):

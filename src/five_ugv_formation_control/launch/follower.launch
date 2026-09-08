@@ -4,6 +4,7 @@
   <arg name="offset_x" default="$(optenv UGV_OFFSET_X -0.8)"/>
   <arg name="offset_y" default="$(optenv UGV_OFFSET_Y 0.8)"/>
   <arg name="offset_yaw" default="0.0"/>
+  <arg name="max_linear" default="0.15"/>
   <arg name="auto_enable" default="false"/>
   <arg name="enable_logger" default="true"/>
   <arg name="log_root" default="$(optenv FORMATION_WS /home/wheeltec/formation_ws)/logs/formation"/>
@@ -29,6 +30,7 @@
       <param name="offset_x" value="$(arg offset_x)"/>
       <param name="offset_y" value="$(arg offset_y)"/>
       <param name="offset_yaw" value="$(arg offset_yaw)"/>
+      <param name="max_linear" value="$(arg max_linear)"/>
       <param name="enabled" value="$(arg auto_enable)"/>
       <param name="leader_pose_topic" value="$(arg leader_pose_topic)"/>
       <param name="leader_valid_topic" value="$(arg leader_valid_topic)"/>

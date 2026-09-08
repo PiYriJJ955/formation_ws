@@ -42,7 +42,7 @@ def main():
                 import rospy
                 from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
                 from nav_msgs.msg import Odometry
-                from std_msgs.msg import Bool, String
+                from std_msgs.msg import Bool, String, Float64
                 rospy.init_node('console_offline_test', anonymous=True, disable_signals=True)
                 velocities, enable_values = {0: [], 1: []}, []
                 subs = [rospy.Subscriber('/ugv%d/cmd_vel' % n, Twist,
@@ -50,6 +50,14 @@ def main():
                         for n in velocities]
                 subs.append(rospy.Subscriber('/five_ugv_formation/enable', Bool,
                                              lambda message: enable_values.append(message.data)))
+                limit_ack = rospy.Publisher('/ugv1/formation_controller/max_linear', Float64, queue_size=1, latch=True)
+                acknowledge = threading.Event()
+                received_limits = []
+                def apply_limit(message):
+                    received_limits.append(message.data)
+                    if acknowledge.is_set():
+                        limit_ack.publish(message)
+                subs.append(rospy.Subscriber('/ugv1/formation_controller/set_max_linear', Float64, apply_limit))
                 pubs = {}
                 for n in (0, 1):
                     prefix = '/ugv%d/' % n
@@ -91,7 +99,8 @@ def main():
                         except ValueError:
                             pass
                 threading.Thread(target=read, daemon=True).start()
-                def pump(seconds, linear=0.0, enabled=False, stale=False, send=True):
+                limits = {'0': 0.12, '1': 0.15}
+                def pump(seconds, linear=0.0, enabled=False, stale=False, send=True, sequence=None, requested=None):
                     deadline, sent = time.monotonic() + seconds, 0.0
                     while time.monotonic() < deadline:
                         while not events.empty():
@@ -103,7 +112,8 @@ def main():
                         now = time.monotonic()
                         if send and latest and now - sent > 0.1:
                             payload = dict(tick=latest['tick'] - (10 if stale else 0), linear=linear, angular=0,
-                                           enable_sequence=1 if enabled else 0, enable=enabled)
+                                           enable_sequence=sequence if sequence is not None else (2 if enabled else 0),
+                                           enable=enabled, linear_limits=limits if requested is None else requested)
                             monitor.stdin.write(json.dumps(payload) + '\n')
                             monitor.stdin.flush()
                             sent = now
@@ -111,13 +121,33 @@ def main():
                 pump(2)
                 assert latest['robots']['1']['pose']['value'] == [2.0, 2.0], latest
                 assert latest['robots']['1']['error']['value'] == 0.12
+                assert not latest['linear_limits']['1']['ready'], latest
+                pump(0.5, enabled=True, sequence=1)
+                assert True not in enable_values, enable_values
+                assert latest['enable_sequence'] == 1 and not latest['enable_sent'], latest
+                acknowledge.set()
+                pump(1.3)
+                assert latest['linear_limits']['1']['applied'] == 0.15, latest
+                assert latest['linear_limits']['1']['ready'], latest
                 pump(0.7, linear=0.1, stale=True)
                 assert not any(value for _, value in velocities[0]), velocities
                 pump(0.8, linear=0.1, enabled=True)
                 assert any(value == 0.1 for _, value in velocities[0]), velocities
                 assert not any(value for _, value in velocities[1]), velocities
                 assert True in enable_values, enable_values
-                assert latest['enable_sequence'] == 1, latest
+                assert latest['enable_sequence'] == 2 and latest['enable_sent'], latest
+                limits.update({'0': 0.04, '1': 0.08})
+                pump(1.2, linear=0.3, enabled=True)
+                assert velocities[0][-1][1] == 0.04, velocities[0][-5:]
+                assert latest['linear_limits']['1']['applied'] == 0.08 and 0.08 in received_limits, latest
+                pump(0.4, linear=-0.3, enabled=True)
+                assert velocities[0][-1][1] == -0.04, velocities[0][-5:]
+                pump(0.4, stale=True, requested={'0': 0.4, '1': 0.4})
+                assert latest['linear_limits']['0']['applied'] == 0.04, latest
+                limits.update({'0': 0.0, '1': 0.0})
+                pump(1.2, linear=0.3, enabled=True)
+                assert velocities[0][-1][1] == 0.0, velocities[0][-5:]
+                assert latest['linear_limits']['1']['applied'] == 0.0, latest
                 # Host sends nothing: lease expires, then remote monitor disables followers and exits.
                 pump(0.8, send=False)
                 assert velocities[0][-1][1] == 0.0, velocities[0][-5:]
@@ -125,7 +155,7 @@ def main():
                 time.sleep(0.15)
                 assert enable_values[-1] is False, enable_values
                 assert velocities[1][-1][1] == 0.0
-                print('Loopback ROS passed: readiness, live telemetry, leader-only motion, stale-command rejection, 0.4 s lease, lost-GUI disable.')
+                print('Loopback ROS passed: telemetry, limit readback, enable refusal without ACK, online limits, bidirectional leader clamping, zero limit, stale-command rejection, lost-GUI disable.')
             finally:
                 stop.set()
                 if publisher_thread:

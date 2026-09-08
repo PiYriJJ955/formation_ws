@@ -43,6 +43,10 @@ for vehicle in range(3):
 config = resolve('five_ugv_formation_control', 'follower.launch', ['ugv_id:=1', 'leader_id:=2'])
 assert config.params['/ugv1/formation_controller/leader_pose_topic'].value == '/ugv2/uwb/pose'
 assert config.params['/ugv1/formation_logger/leader_name'].value == 'ugv2'
+for limit in (0.0, 0.08, 0.5):
+    config = resolve('five_ugv_formation_control', 'follower.launch',
+                     ['ugv_id:=5', 'leader_id:=3', 'max_linear:=' + str(limit)])
+    assert config.params['/ugv5/formation_controller/max_linear'].value == limit
 print('Fleet launch checks passed for ugv0, ugv1 and ugv2.')
 
 with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml') as custom:

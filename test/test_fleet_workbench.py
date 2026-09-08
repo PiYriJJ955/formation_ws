@@ -18,12 +18,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from fleet_console import DEFAULTS, FleetConsole, RobotSession
 from fleet_deploy import parse_robot_config, replace_setting, robot_number, update_identity
 from fleet_terminal import Terminal
-from fleet_workbench import FleetWorkbench, Monitor, launch_command, localization_config
+from fleet_workbench import FleetWorkbench, Monitor, launch_command, localization_config, saved_limits, session_limits
 
 DEFAULTS = dict(DEFAULTS, password="test-secret")
 
 
 class WorkbenchChecks(unittest.TestCase):
+    def test_saved_limits_follow_ip_and_reach_launch(self):
+        options = dict(DEFAULTS, linear_limits_json=json.dumps({'192.0.2.1': 0.08}))
+        self.assertEqual(session_limits(options, {'192.0.2.1': 4, '192.0.2.2': 2}), {'4': 0.08, '2': 0.15})
+        self.assertIn('max_linear:=0.08', launch_command('follower', options, '192.0.2.1', 'ugv4', '/tmp/stage'))
+        for value in (-1, 0.51, float('nan'), float('inf'), True, '0.1'):
+            with self.assertRaises(ValueError):
+                saved_limits(dict(options, linear_limits_json=json.dumps({'192.0.2.1': value})))
+
     def test_uwb_cannot_share_chassis_serial_through_alias(self):
         from fleet_ros import check_serial
         with tempfile.TemporaryDirectory() as directory:
@@ -190,7 +198,8 @@ class WorkbenchChecks(unittest.TestCase):
                 app.vars['leader'].set('ugv3')
                 wb.active_leader = 'ugv3'
                 monitor = wb.monitor = SimpleNamespace(ready=True, last=time.monotonic(), subscribers=1,
-                                                       drive=(0, 0, 0), enable=True, enable_sequence=0)
+                                                       drive=(0, 0, 0), enable=True, enable_sequence=0,
+                                                       limits={'3': 0.15}, limit_status={})
                 def activate():
                     monitor.last = time.monotonic()
                     wb.activate_keyboard()
@@ -209,6 +218,18 @@ class WorkbenchChecks(unittest.TestCase):
                     release(key)
                     self.assertEqual(monitor.drive[:2], (0, 0))
                 self.assertIn('ugv3', wb.keyboard_status.get())
+                monitor.limits['3'] = 0.06
+                press('w')
+                self.assertEqual(monitor.drive[:2], (0.06, 0))
+                release('w')
+                press('s')
+                self.assertEqual(monitor.drive[:2], (-0.06, 0))
+                release('s')
+                monitor.limits['3'] = 0.0
+                press('w')
+                self.assertEqual(monitor.drive[:2], (0, 0))
+                release('w')
+                monitor.limits['3'] = 0.15
                 press('w')
                 wb.keyboard.event_generate('<KeyRelease>', keysym='w')
                 press('w')  # X11 repeat pair keeps the current motion.
@@ -301,6 +322,40 @@ class WorkbenchChecks(unittest.TestCase):
             app = FleetConsole(root, Path(directory) / 'settings.json')
             try:
                 wb = app.workbench
+                self.assertEqual(len(wb.limit_rows), 5)
+                ip = '192.168.0.106'
+                wb.limit_rows[ip][1].set('0.12')
+                wb.apply_limits()
+                self.assertEqual(json.loads(app.config_path.read_text())['options']['linear_limits_json'],
+                                 app.vars['linear_limits_json'].get())
+                self.assertEqual(saved_limits(app.current_options())[ip], 0.12)
+                wb.active_identities = {ip: 1}
+                wb.current_ids = [1]
+                monitor = wb.monitor = SimpleNamespace(ready=True, last=time.monotonic(),
+                                                      limits={'1': 0.15}, limit_status={},
+                                                      enable=False, enable_sequence=0)
+                wb.apply_limits()
+                self.assertEqual(monitor.limits, {'1': 0.12})
+                with patch.object(wb, 'fresh', return_value=True):
+                    wb.set_enabled(True)
+                    self.assertFalse(monitor.enable)  # No readback, including older controllers.
+                    monitor.limit_status = {'1': {'ready': True, 'applied': 0.12, 'requested': 0.12}}
+                    wb.set_enabled(True)
+                    self.assertTrue(monitor.enable)
+                    wb.refresh_limits()
+                    self.assertIn('已生效', wb.limit_rows[ip][2].get())
+                    wb.limit_rows[ip][1].set('0.09')
+                    wb.refresh_limits()
+                    self.assertEqual(wb.limit_rows[ip][1].get(), '0.09')  # Refresh retains unsaved edits.
+                    wb.apply_limits()
+                    self.assertFalse(wb.limit_ready(1))  # Old ACK cannot confirm a changed limit.
+                wb.limit_rows[ip][1].set('nan')
+                with patch.object(app.messagebox, 'showerror') as error:
+                    wb.apply_limits()
+                    error.assert_called_once()
+                self.assertEqual(saved_limits(app.current_options())[ip], 0.09)
+                wb.limit_rows[ip][1].set('0.09')
+                wb.monitor = None
                 self.assertEqual([app.notebook.tab(tab, 'text') for tab in app.notebook.tabs()],
                                  ['扫描与连接', '编队算法', '小车定位图'])
                 with patch.object(app, 'selected_action') as action:

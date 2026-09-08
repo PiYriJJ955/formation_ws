@@ -73,7 +73,9 @@ class DisplacementFollower(object):
         self.k_position = float(rospy.get_param("~k_position", 0.8))
         self.k_heading = float(rospy.get_param("~k_heading", 1.8))
         self.k_heading_sync = float(rospy.get_param("~k_heading_sync", 1.2))
-        self.max_linear = abs(float(rospy.get_param("~max_linear", 0.15)))
+        self.max_linear = float(rospy.get_param("~max_linear", 0.15))
+        if not isfinite(self.max_linear) or not 0.0 <= self.max_linear <= 0.5:
+            raise ValueError("max_linear must be finite and between 0 and 0.5 m/s")
         self.max_angular = abs(float(rospy.get_param("~max_angular", 0.8)))
         self.rotate_threshold = abs(float(
             rospy.get_param("~rotate_in_place_threshold", 0.7)))
@@ -147,6 +149,10 @@ class DisplacementFollower(object):
             "~heading_blend", Float64, queue_size=5)
         self.state_pub = rospy.Publisher("~state", String, queue_size=1, latch=True)
 
+        self.limit_pub = rospy.Publisher("~max_linear", Float64, queue_size=1, latch=True)
+        self.limit_pub.publish(Float64(data=self.max_linear))
+        rospy.Subscriber("~set_max_linear", Float64, self.limit_cb, queue_size=1)
+
         rospy.on_shutdown(self.stop)
         self.publish_state("READY" if self.enabled else "DISABLED")
         rospy.loginfo("%s displacement follower started; offset=(%.2f, %.2f)",
@@ -215,6 +221,16 @@ class DisplacementFollower(object):
         raw_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
         if raw_yaw is not None:
             self.self_heading.update(raw_yaw, rospy.Time.now())
+
+    def limit_cb(self, msg):
+        value = float(msg.data)
+        if not isfinite(value) or not 0.0 <= value <= 0.5:
+            rospy.logwarn("Rejected invalid linear speed limit: %r", value)
+            return
+        if value != self.max_linear:
+            self.max_linear = value
+            rospy.set_param("~max_linear", value)
+        self.limit_pub.publish(Float64(data=self.max_linear))
 
     def enable_cb(self, msg):
         self.enabled = bool(msg.data)
@@ -402,7 +418,7 @@ def self_test():
     # Exercise callbacks and the control loop without connecting to a ROS graph.
     with patch.multiple(rospy, get_param=lambda name, default: default,
                         Subscriber=Mock(), Publisher=Mock(side_effect=lambda *a, **k: Mock()),
-                        Timer=Mock(), on_shutdown=Mock(), loginfo=Mock(),
+                        Timer=Mock(), on_shutdown=Mock(), loginfo=Mock(), set_param=Mock(),
                         logwarn=Mock(), loginfo_throttle=Mock(), logwarn_throttle=Mock()), \
             patch.object(rospy.Time, "now", return_value=rospy.Time(10.0)) as clock:
         # A subscriber can invoke callbacks before its constructor returns.
@@ -426,6 +442,8 @@ def self_test():
             msg = message_type()
             if message_type is Bool:
                 msg.data = True
+            elif message_type is Float64:
+                msg.data = 0.15
             elif message_type is PoseWithCovarianceStamped:
                 msg.pose.pose.orientation.w = 1.0
             callback(msg)
@@ -519,6 +537,21 @@ def self_test():
             controller.control_cb(None)
             return (controller.state_pub.publish.call_args[0][0].data,
                     controller.cmd_pub.publish.call_args[0][0])
+
+        # Runtime limits constrain actual control output and are acknowledged.
+        assert step(19.0, 1.0)[1].linear.x == 0.15
+        for value in (0.07, 0.0, 0.3):
+            controller.limit_cb(Float64(data=value))
+            assert step(19.1, 1.0)[1].linear.x == value
+            assert controller.limit_pub.publish.call_args[0][0].data == value
+            rospy.set_param.assert_called_with("~max_linear", value)
+        for value in (-0.01, 0.51, float('nan'), float('inf')):
+            controller.limit_cb(Float64(data=value))
+            assert step(19.2, 1.0)[1].linear.x == 0.3
+        with patch.object(rospy, "get_param", side_effect=lambda name, default:
+                          0.0 if name == "~max_linear" else default):
+            assert DisplacementFollower().max_linear == 0.0
+        controller.limit_cb(Float64(data=0.15))
 
         assert step(20.0, 0.0, 1.0)[0] == "FOLLOWING"
         assert controller.heading_blend_pub.publish.call_args[0][0].data == 0.0

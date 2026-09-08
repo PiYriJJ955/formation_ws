@@ -23,11 +23,28 @@ LOCALIZATION = ROOT / 'src/five_ugv_uwb_localization'
 DEFAULTS = {
     'leader': 'ugv1', 'formation_selected': '192.168.0.106,192.168.0.108,192.168.0.109,192.168.0.110,192.168.0.114',
     'anchors_json': '',
+    'linear_limits_json': '{}', 'fold_limits': True,
     'active_tab': '0', 'formation_step': '0', 'fold_keyboard': True, 'fold_logs': True,
 }
 COLORS = ['#1976d2', '#e76622', '#009688', '#9b51b6', '#c0395a', '#8a7600']
 KEY_DIRECTIONS = {'w': (1, 0), 'up': (1, 0), 's': (-1, 0), 'down': (-1, 0),
                   'a': (0, 1), 'left': (0, 1), 'd': (0, -1), 'right': (0, -1)}
+
+
+def saved_limits(options):
+    values = json.loads(options.get('linear_limits_json', '{}'))
+    if not isinstance(values, dict):
+        raise ValueError('线速度约束配置应为 IP 与上限的对应表')
+    for ip, value in values.items():
+        ipaddress.IPv4Address(ip)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 0.5:
+            raise ValueError('%s：线速度上限必须在 0–0.5 m/s 之间' % ip)
+    return values
+
+
+def session_limits(options, identities):
+    values = saved_limits(options)
+    return {str(number): values.get(ip, 0.15) for ip, number in identities.items()}
 
 
 @lru_cache(maxsize=16)
@@ -80,15 +97,15 @@ def launch_command(step, options, ip, name, remote, row=None):
         if number == leader:
             raise ValueError('领航车不启动跟随控制器')
         command = ('%s check --step follower --ids %d; exec flock -n "$HOME/.cache/formation-console/follower.lock" '
-                   'roslaunch five_ugv_formation_control follower.launch ugv_id:=%d leader_id:=%d auto_enable:=false' %
-                   (helper, number, number, leader))
+                   'roslaunch five_ugv_formation_control follower.launch ugv_id:=%d leader_id:=%d auto_enable:=false max_linear:=%s' %
+                   (helper, number, number, leader, saved_limits(options).get(ip, 0.15)))
     else:
         raise ValueError('未知启动步骤')
     return ros_command(options, ip, command)
 
 
 class Monitor:
-    def __init__(self, client, command, events):
+    def __init__(self, client, command, events, limits=None):
         self.client, self.command, self.events = client, command, events
         self.stop = threading.Event()
         self.drive = (0.0, 0.0, 0.0)
@@ -96,6 +113,8 @@ class Monitor:
         self.ready, self.last, self.tick = False, 0.0, 0.0
         self.ui_heartbeat = time.monotonic()
         self.subscribers = 0
+        self.limits = limits or {}
+        self.limit_status = {}
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
@@ -131,6 +150,7 @@ class Monitor:
                         if data.get('event') == 'sample':
                             self.ready, self.last, self.tick = True, now, data['tick']
                             self.subscribers = data['leader_subscribers']
+                            self.limit_status = data.get('linear_limits', {})
                             self.events.put(('sample', data))
                 if channel.exit_status_ready() and not channel.recv_ready():
                     raise RuntimeError('监视进程退出：' + recent)
@@ -141,7 +161,8 @@ class Monitor:
                     if now - changed > 0.25 or not self.ready:
                         linear = angular = 0.0
                     payload = dict(tick=self.tick, linear=linear, angular=angular,
-                                   enable_sequence=self.enable_sequence, enable=self.enable)
+                                   enable_sequence=self.enable_sequence, enable=self.enable,
+                                   linear_limits=self.limits)
                     channel.sendall((json.dumps(payload) + '\n').encode())
                     sent = now
                 self.stop.wait(0.02)
@@ -175,6 +196,8 @@ class FleetWorkbench:
         self.signature = None
         self.terminals = []
         self.monitor = None
+        self.active_identities = {}
+        self.limit_rows = {}
         self.keys_down, self.key_releases = set(), {}
         self.keyboard_direction = None
         self.run_id = uuid.uuid4().hex
@@ -289,6 +312,8 @@ class FleetWorkbench:
                 self.vehicles.item(ip, values=values)
             else:
                 self.vehicles.insert('', 'end', iid=ip, values=values)
+        if hasattr(self, 'limits_panel'):
+            self.refresh_limits()
 
     def addresses(self):
         addresses = list(self.vehicles.selection())
@@ -367,6 +392,7 @@ class FleetWorkbench:
             return
         try:
             options = self.app.current_options()
+            saved_limits(options)
             addresses = self.addresses()
             ipaddress.IPv4Address(options['master_ip'])
             robot_number(options['leader'])
@@ -521,10 +547,13 @@ class FleetWorkbench:
                 if robot_number(options['leader']) not in ids:
                     self.events.put(('log', '当前未选领航车，实时监视请在步骤 4 启动'))
                 else:
-                    command = ros_command(options, master, 'python -u %s/fleet_ros.py monitor --ids %s --leader %d' %
-                                          (shlex.quote(remotes[master]), ','.join(map(str, ids)), robot_number(options['leader'])))
-                    self.monitor = Monitor(clients.pop(master), command, self.events)
-                    self.events.put(('monitor_started', ids, options['leader']))
+                    identities = {ip: robot_number(row['robot_id']) for ip, row in rows.items()}
+                    limits = session_limits(options, identities)
+                    command = ros_command(options, master, 'python -u %s/fleet_ros.py monitor --ids %s --leader %d --linear-limits %s' %
+                                          (shlex.quote(remotes[master]), ','.join(map(str, ids)), robot_number(options['leader']),
+                                           shlex.quote(json.dumps(limits))))
+                    self.monitor = Monitor(clients.pop(master), command, self.events, limits)
+                    self.events.put(('monitor_started', ids, options['leader'], identities))
                     deadline = time.monotonic() + 20
                     while not self.monitor.ready:
                         if self.cancel.wait(0.1) or not self.monitor.thread.is_alive() or time.monotonic() > deadline:
@@ -563,6 +592,9 @@ class FleetWorkbench:
         if enabled:
             now = time.monotonic()
             for number in self.current_ids:
+                if not self.limit_ready(number):
+                    self.status.set('ugv%d 线速度上限尚未确认，请在第三页检查；旧控制器需同步仓库并重新启动' % number)
+                    return
                 if not self.fresh(str(number), now):
                     self.status.set('ugv%d 定位无效或过期，不能使能跟随' % number)
                     return
@@ -691,6 +723,7 @@ class FleetWorkbench:
             self.keyboard_status.set('线速度需大于 0 且不超过 0.5 m/s，角速度需大于 0 且不超过 1.5 rad/s。')
             return
         x, z = KEY_DIRECTIONS.get(self.keyboard_direction, (0, 0))
+        linear = min(linear, self.monitor.limits[str(robot_number(self.active_leader))])
         self.monitor.drive = (x * linear, z * angular, now)
         self.keyboard_status.set('键盘已启用 → %s · 输出 %.2f m/s，%.2f rad/s · 松键停车' %
                                  (self.active_leader, x * linear, z * angular))
@@ -728,6 +761,77 @@ class FleetWorkbench:
                 self.app.messagebox.showerror('配置有误', str(error), parent=dialog)
         self.ttk.Button(dialog, text='保存，下次启动自动 SSH 应用', command=save).grid(row=3, columnspan=2, pady=12)
 
+    def limit_ready(self, number):
+        monitor = self.monitor
+        if not monitor or not monitor.ready or time.monotonic() - monitor.last > 0.6:
+            return False
+        row = monitor.limit_status.get(str(number), {})
+        expected = monitor.limits.get(str(number))
+        return row.get('ready', False) and expected is not None and row.get('applied') == row.get('requested') == expected
+
+    def refresh_limits(self):
+        values = saved_limits(self.app.current_options())
+        for ip in list(self.limit_rows):
+            if ip not in self.app.robots:
+                self.limit_rows.pop(ip)[0].master.destroy()
+        for index, ip in enumerate(sorted(self.app.robots, key=ipaddress.IPv4Address)):
+            row = self.app.robots[ip]
+            name = row.get('pending_id') or row.get('robot_id') or row.get('name', ip)
+            if ip not in self.limit_rows:
+                card = self.ttk.Frame(self.limits_panel, padding=(5, 2))
+                card.grid(row=index // 5, column=index % 5, sticky='nsew')
+                self.limits_panel.columnconfigure(index % 5, weight=1)
+                label = self.ttk.Label(card)
+                label.pack(anchor='w')
+                draft = self.tk.StringVar(value=str(values.get(ip, 0.15)))
+                self.ttk.Spinbox(card, from_=0, to=0.5, increment=0.01, width=9,
+                                 textvariable=draft).pack(anchor='w')
+                status = self.tk.StringVar()
+                self.ttk.Label(card, textvariable=status).pack(anchor='w')
+                self.limit_rows[ip] = (label, draft, status)
+            label, draft, status = self.limit_rows[ip]
+            label.master.grid_configure(row=index // 5, column=index % 5)
+            number = self.active_identities.get(ip)
+            label.configure(text='%s · %s%s' % (name, ip, '（领航）' if name == self.app.vars['leader'].get() else ''))
+            value = values.get(ip, 0.15)
+            try:
+                editing = float(draft.get()) != value
+            except ValueError:
+                editing = True
+            if editing:
+                message = '尚未保存'
+            elif number is None or not self.monitor or not self.monitor.ready:
+                message = '已保存 %g · 待连接' % value
+            elif self.limit_ready(number):
+                message = '已生效 %g m/s' % value
+            else:
+                message = '待确认 · 检查连接 / 版本'
+            status.set(message)
+
+    def apply_limits(self):
+        if self.worker and self.worker.is_alive():
+            self.limits_status.set('启动任务执行中，请完成后再保存限速。')
+            return
+        try:
+            values = saved_limits(self.app.current_options())
+            for ip, (_, draft, _) in self.limit_rows.items():
+                try:
+                    value = float(draft.get())
+                except ValueError:
+                    raise ValueError('%s：请输入 0–0.5 m/s 的线速度上限' % ip)
+                if not 0 <= value <= 0.5:
+                    raise ValueError('%s：线速度上限必须在 0–0.5 m/s 之间' % ip)
+                values[ip] = value
+            self.app.vars['linear_limits_json'].set(json.dumps(values, sort_keys=True))
+            self.app.save()
+            if self.monitor:
+                self.monitor.limits = session_limits(self.app.current_options(), self.active_identities)
+            self.update_keyboard(time.monotonic())
+            self.refresh_limits()
+            self.limits_status.set('已保存；在线参与车辆等待回读确认，其余车辆在下次启动时应用。')
+        except ValueError as error:
+            self.app.messagebox.showerror('线速度约束', str(error))
+
     def make_map(self):
         page = self.ttk.Frame(self.app.notebook, padding=10)
         self.app.notebook.add(page, text='小车定位图')
@@ -750,6 +854,16 @@ class FleetWorkbench:
         self.ttk.Button(pad, text='停车 / 禁用跟随（空格 / Esc）', command=self.emergency).pack(side='left')
         self.ttk.Label(page, text='W / ↑ 前进；S / ↓ 后退；A / ← 左转；D / → 右转。按住行驶，松键停车；离开控制区后需重新点击启用。').pack(anchor='w')
         self.ttk.Label(page, textvariable=self.keyboard_status).pack(anchor='w')
+        limits = self.fold(page, '所有小车线速度上限（m/s）', 'fold_limits')
+        self.limits_panel = self.ttk.Frame(limits)
+        self.limits_panel.pack(fill='x')
+        self.refresh_limits()
+        actions = self.ttk.Frame(limits)
+        actions.pack(fill='x', pady=(4, 0))
+        self.ttk.Button(actions, text='保存并应用', command=self.apply_limits).pack(side='left', padx=5)
+        self.ttk.Label(actions, text='范围 0–0.5；0 仅停止平移。跟随车需保留比领航车更大的追赶速度余量。').pack(side='left')
+        self.limits_status = self.tk.StringVar(value='按 IP 记忆；领航键盘与跟随控制器均受限。旧版跟随控制器需同步仓库并重启。')
+        self.ttk.Label(limits, textvariable=self.limits_status, wraplength=1080).pack(anchor='w', padx=5)
         self.map_status = self.tk.StringVar(value='尚未连接。基站坐标读取自 final_localization.yaml；单位：米。')
         self.ttk.Label(page, textvariable=self.map_status, wraplength=1080).pack(fill='x', pady=7)
         self.ttk.Label(page, text='三角形：基站　圆点：车辆　实线：实际轨迹　虚线：目标轨迹 / 误差　灰色：定位过期或无效').pack(anchor='w')
@@ -944,13 +1058,19 @@ class FleetWorkbench:
                         if error.get('age', 999) < 0.6:
                             self.error_history.setdefault(number, deque(maxlen=1000)).append(error['value'])
                 if self.monitor and event[1].get('enable_sequence') == self.monitor.enable_sequence:
-                    marker = (self.monitor.enable_sequence, self.monitor.enable)
+                    sent = event[1].get('enable_sent', False)
+                    marker = (self.monitor.enable_sequence, sent)
                     if marker != getattr(self, 'enable_ack', None):
                         self.enable_ack = marker
-                        self.append_log('ROS 已发送：' + ('使能编队跟随' if self.monitor.enable else '禁用跟随'))
+                        message = 'ROS 已发送：' + ('使能编队跟随' if sent else '禁用跟随')
+                        if self.monitor.enable and not sent:
+                            message = '使能被拒绝：线速度上限未确认，请检查第三页后重新使能'
+                            self.status.set(message)
+                        self.append_log(message)
             elif kind == 'monitor_started':
                 self.current_ids = event[1]
                 self.active_leader = event[2]
+                self.active_identities = event[3]
                 self.samples.clear()
                 self.clear_trails()
                 self.yaw_origin.clear()

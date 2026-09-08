@@ -62,7 +62,7 @@ class FormationLogger(object):
         "desired_vx", "desired_vy", "desired_speed",
         "leader_cmd_linear_x", "leader_cmd_angular_z",
         "cmd_linear_x", "cmd_angular_z",
-        "enabled", "state",
+        "enabled", "state", "max_linear",
         "leader_valid", "leader_residual_rms", "leader_full_residual_rms",
         "leader_anchor_count", "leader_loo_id", "leader_jump_ids",
         "follower_valid", "follower_residual_rms", "follower_full_residual_rms",
@@ -174,7 +174,7 @@ class FormationLogger(object):
         rospy.Subscriber(self.topic("heading_error_topic",
                                     "formation_controller/heading_error"),
                          Float64, self.number_cb, callback_args="heading_error", queue_size=50)
-        for name in ("heading_sync_error", "heading_blend"):
+        for name in ("heading_sync_error", "heading_blend", "max_linear"):
             rospy.Subscriber(self.topic(name + "_topic", "formation_controller/" + name),
                              Float64, self.number_cb, callback_args=name, queue_size=50)
         rospy.Subscriber(self.topic("leader_cmd_vel_topic", "/ugv0/cmd_vel"),
