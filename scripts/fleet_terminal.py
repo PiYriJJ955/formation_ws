@@ -11,8 +11,10 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 import tty
+import weakref
 
 
 def write_json(path, value):
@@ -24,6 +26,9 @@ def write_json(path, value):
 
 
 class Terminal:
+    _tabs = weakref.WeakSet()
+    _lock = threading.Lock()
+
     def __init__(self, ip, options, host_keys, command='', title='SSH'):
         executable = shutil.which('gnome-terminal')
         if not executable:
@@ -33,9 +38,31 @@ class Terminal:
         request = self.directory / 'request.json'
         write_json(request, dict(ip=ip, options=options, host_keys=str(host_keys), command=command))
         try:
-            self.process = subprocess.Popen([executable, '--title=' + title, '--',
-                                             sys.executable, str(Path(__file__).resolve()), str(request)],
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # GNOME needs the previous screen ID to attach separate invocations as tabs.
+            with self._lock:
+                environment = dict(os.environ)
+                for key in ('GNOME_TERMINAL_SERVICE', 'GNOME_TERMINAL_SCREEN'):
+                    environment.pop(key, None)
+                for terminal in list(self._tabs):
+                    status = terminal.status()
+                    if 'pid' in status:
+                        try:
+                            os.kill(status['pid'], 0)
+                        except ProcessLookupError:
+                            continue
+                    elif status['state'] != '打开终端中':
+                        continue
+                    environment.update(terminal.environment)
+                    break
+                result = subprocess.run([executable, '--tab', '--print-environment', '--title=' + title, '--',
+                                         sys.executable, str(Path(__file__).resolve()), str(request)],
+                                        env=environment, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, universal_newlines=True, check=True, timeout=10)
+                self.environment = dict(line.split('=', 1) for line in result.stdout.splitlines()
+                                        if line.startswith(('GNOME_TERMINAL_SERVICE=', 'GNOME_TERMINAL_SCREEN=')))
+                if 'GNOME_TERMINAL_SCREEN' not in self.environment:
+                    raise RuntimeError('终端未启动：' + result.stderr.strip())
+                self._tabs.add(self)
         except Exception:
             shutil.rmtree(str(self.directory))
             raise
@@ -50,8 +77,7 @@ class Terminal:
                     return {'state': '已关闭', 'error': '终端进程已退出'}
             return result
         except (OSError, ValueError):
-            code = self.process.poll()
-            if code not in (None, 0) or time.monotonic() - self.started > 15:
+            if time.monotonic() - self.started > 15:
                 try:
                     (self.directory / 'request.json').unlink()
                 except FileNotFoundError:

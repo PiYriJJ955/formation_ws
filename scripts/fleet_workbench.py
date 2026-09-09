@@ -274,13 +274,15 @@ class FleetWorkbench:
         steps = self.ttk.Notebook(page)
         steps.pack(fill='x', pady=4)
         for title, description, actions in [
-            ('1 · 配置与 Master', '同步所选车辆的 UGV_ID、mini_4wd、ROS_IP 和 Master，检查环境并在 Master IP 主机启动 roscore。',
-             [('检查配置 / 启动 Master', lambda: self.start('master'))]),
-            ('2 · 底盘与定位', '为每辆车打开 roslaunch SSH 终端，等待 odom、UWB pose 和有效定位。基站设置随启动上传。',
+            ('1 · 配置检查', '通过 SSH 检查并同步所选车辆的 UGV_ID、mini_4wd、ROS_IP、Master、UWB 串口和编队偏移。首次使用或修改车端配置后执行。',
+             [('检查并同步配置', lambda: self.start('config'))]),
+            ('2 · Master', '在 Master IP 主机检查或启动 roscore。各启动步骤直接使用已有车端配置。',
+             [('启动 Master', lambda: self.start('master'))]),
+            ('3 · 底盘与定位', '为每辆车打开 roslaunch SSH 标签页，等待 odom、UWB pose 和有效定位。基站设置随启动上传。',
              [('启动底盘 + UWB 定位', lambda: self.start('chassis'))]),
-            ('3 · 跟随算法', '为领航车以外的所选车辆启动 follower.launch，使用各车偏移；等待控制器状态。',
+            ('4 · 跟随算法', '为领航车以外的所选车辆启动 follower.launch，使用各车偏移；等待控制器状态。',
              [('启动跟随控制器', lambda: self.start('follower'))]),
-            ('4 · 监视与使能', '接收共享 Master 上的实时状态；使能后跟随车开始跟踪目标。',
+            ('5 · 监视与使能', '接收共享 Master 上的实时状态；使能后跟随车开始跟踪目标。',
              [('连接实时监视', lambda: self.start('monitor')), ('使能编队跟随', lambda: self.set_enabled(True)),
               ('立即停车 / 禁用跟随', self.emergency)])]:
             frame = self.ttk.Frame(steps, padding=8)
@@ -290,7 +292,7 @@ class FleetWorkbench:
             row.pack(anchor='w', pady=(6, 0))
             for label, command in actions:
                 self.ttk.Button(row, text=label, command=command).pack(side='left', padx=(0, 8))
-        steps.select(max(0, min(3, int(app.vars['formation_step'].get()))))
+        steps.select(max(0, min(4, int(app.vars['formation_step'].get()))))
         steps.bind('<<NotebookTabChanged>>', lambda _: app.vars['formation_step'].set(str(steps.index(steps.select()))))
         logs = self.fold(page, '终端与启动日志', 'fold_logs', expand=True)
         self.log = self.tk.Text(logs, height=7, state='disabled', wrap='word', font=('Monospace', 10))
@@ -499,7 +501,7 @@ class FleetWorkbench:
 
     def run_start(self, step, options, rows, config):
         clients, remotes, results, launched = {}, {}, {}, {}
-        offsets = {}
+        configs = dict(rows)
         current = options['master_ip']
         try:
             for session in list(self.app.sessions.values()):
@@ -507,30 +509,32 @@ class FleetWorkbench:
                     session.thread.join(15)
                     if session.thread.is_alive():
                         raise RuntimeError('独立底盘尚未停止：' + session.ip)
-            for ip in dict.fromkeys(list(rows) + [options['master_ip']]):
+            hosts = list(rows)
+            if step in ('master', 'monitor'):
+                hosts = []
+            elif step == 'follower':
+                hosts = [ip for ip in rows if rows[ip]['robot_id'] != options['leader']]
+            for ip in dict.fromkeys(hosts + [options['master_ip']]):
                 current = ip
                 if self.cancel.is_set():
                     raise RuntimeError('启动已取消')
-                self.events.put(('state', ip, 'SSH 配置检查中'))
+                self.events.put(('state', ip, 'SSH 配置检查中' if step in ('all', 'config') else 'SSH 连接中'))
                 client = clients[ip] = self.connect(ip, options)
-                existing = read_robot_config(client)
-                if ip in rows:
+                if step in ('all', 'config') and ip in rows:
+                    existing = read_robot_config(client)
                     if not existing['robot_id']:
                         raise RuntimeError('工作空间尚未安装，请先点击“立即同步 Git 仓库”')
-                    if step == 'monitor':
-                        if existing['robot_id'] != rows[ip]['robot_id'] or existing['ros_master'] != 'http://%s:11311' % options['master_ip']:
-                            raise RuntimeError('车端编号 / Master 与界面不一致，请先读取或更新配置')
-                    else:
-                        values = dict(UGV_ID=str(robot_number(rows[ip]['robot_id'])),
-                                      ROS_MASTER_URI='http://%s:11311' % options['master_ip'], ROS_IP=ip, CAR_MODE='mini_4wd')
-                        values.update(rows[ip].get('formation_config', {}))
-                        existing = update_config(client, values)
-                    if rows[ip]['robot_id'] != options['leader']:
-                        offsets[str(robot_number(rows[ip]['robot_id']))] = [float(existing.get('offset_x', -0.8)),
-                                                                           float(existing.get('offset_y', 0.8))]
+                    values = dict(UGV_ID=str(robot_number(rows[ip]['robot_id'])),
+                                  ROS_MASTER_URI='http://%s:11311' % options['master_ip'], ROS_IP=ip, CAR_MODE='mini_4wd')
+                    values.update(rows[ip].get('formation_config', {}))
+                    existing = configs[ip] = update_config(client, values)
                     self.events.put(('config', ip, existing))
                 remote = remotes[ip] = self.stage(client, config)
-                results[ip] = '配置已检查'
+                results[ip] = '配置已检查，启动文件已上传' if step in ('all', 'config') else '启动文件已上传'
+                self.events.put(('state', ip, results[ip]))
+            if step == 'config':
+                self.events.put(('done', '配置检查完成；可继续启动 Master。', results))
+                return
             master = options['master_ip']
             probe = 'python -u %s/fleet_ros.py master --timeout ' % shlex.quote(remotes[master])
             current = master
@@ -543,6 +547,8 @@ class FleetWorkbench:
                         raise
                     self.launch('master', master, rows.get(master, {}).get('robot_id', options['leader']), options, remotes[master])
             run_remote(clients[master], ros_command(options, master, probe + '25'), self.cancel, timeout=35)
+            results[master] = 'ROS Master 已就绪'
+            self.events.put(('state', master, results[master]))
             if step in ('all', 'chassis', 'follower'):
                 for ip, row in rows.items():
                     current = ip
@@ -582,8 +588,12 @@ class FleetWorkbench:
                         raise RuntimeError('上次实时监视尚未退出')
                 ids = [robot_number(row['robot_id']) for row in rows.values()]
                 if robot_number(options['leader']) not in ids:
-                    self.events.put(('log', '当前未选领航车，实时监视请在步骤 4 启动'))
+                    self.events.put(('log', '当前未选领航车，实时监视请在“监视与使能”启动'))
                 else:
+                    # Use the last read-back offsets; edits take effect in the configuration step.
+                    offsets = {str(robot_number(row['robot_id'])):
+                               [float(configs[ip].get('offset_x', -0.8)), float(configs[ip].get('offset_y', 0.8))]
+                               for ip, row in rows.items() if row['robot_id'] != options['leader']}
                     identities = {ip: robot_number(row['robot_id']) for ip, row in rows.items()}
                     limits = session_limits(options, identities)
                     command = ros_command(options, master, 'python -u %s/fleet_ros.py monitor --ids %s --leader %d --linear-limits %s --offsets %s --bounds=%s' %
@@ -596,7 +606,7 @@ class FleetWorkbench:
                     while not self.monitor.ready:
                         if self.cancel.wait(0.1) or not self.monitor.thread.is_alive() or time.monotonic() > deadline:
                             raise RuntimeError('实时监视未就绪，检查 SSH / ROS Master')
-            self.events.put(('done', '启动任务完成；在步骤 4 检查并使能跟随。', results))
+            self.events.put(('done', '启动任务完成；在“监视与使能”检查并使能跟随。', results))
         except Exception as error:
             results[current] = '失败：' + str(error)
             self.events.put(('state', current, results[current]))
@@ -801,11 +811,11 @@ class FleetWorkbench:
                     raise ValueError('偏移必须是有限数值')
                 row['formation_config'] = updated
                 self.app.save()
-                self.status.set(ip + ' 配置已保存，下次执行启动步骤时通过 SSH 应用；运行中的节点需重启。')
+                self.status.set(ip + ' 配置已保存，执行“配置检查”或“快捷总启动”时应用；运行中的节点需重启。')
                 dialog.destroy()
             except ValueError as error:
                 self.app.messagebox.showerror('配置有误', str(error), parent=dialog)
-        self.ttk.Button(dialog, text='保存，下次启动自动 SSH 应用', command=save).grid(row=3, columnspan=2, pady=12)
+        self.ttk.Button(dialog, text='保存，在配置检查时应用', command=save).grid(row=3, columnspan=2, pady=12)
 
     def limit_ready(self, number):
         monitor = self.monitor
@@ -999,8 +1009,8 @@ class FleetWorkbench:
         limits.pack(fill='x', pady=5)
         self.ttk.Label(limits, text='全车线速度上限 m/s').pack(side='left', padx=(4, 5))
         self.limit_input = self.tk.StringVar(value=str(saved_linear_limit(self.app.current_options())))
-        self.ttk.Spinbox(limits, from_=0, to=0.5, increment=0.01, width=7,
-                         textvariable=self.limit_input).pack(side='left')
+        self.tk.Spinbox(limits, from_=0, to=0.5, increment=0.01, width=7,
+                        textvariable=self.limit_input).pack(side='left')
         self.ttk.Button(limits, text='应用到全部', command=self.apply_limits).pack(side='left', padx=8)
         self.ttk.Label(limits, text='0–0.5；0 时路径暂停').pack(side='left')
         self.limits_status = self.tk.StringVar()

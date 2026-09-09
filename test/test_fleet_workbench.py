@@ -97,6 +97,60 @@ class WorkbenchChecks(unittest.TestCase):
         self.assertIn('心跳超时', events.get_nowait()[1])
         self.assertEqual(closed, ['channel', 'client'])
 
+    def test_individual_steps_check_configuration_only_when_requested(self):
+        workbench = FleetWorkbench.__new__(FleetWorkbench)
+        workbench.app = SimpleNamespace(sessions={})
+        workbench.cancel = threading.Event()
+        leader, follower, master = '192.0.2.1', '192.0.2.2', '192.0.2.3'
+        options = dict(DEFAULTS, master_ip=master)
+        rows = {leader: {'robot_id': 'ugv1'},
+                follower: {'robot_id': 'ugv2', 'offset_x': '-1.2', 'offset_y': '0.4',
+                           'formation_config': {'UWB_PORT': '/dev/ttyUSB7', 'UGV_OFFSET_X': '-2.0'}}}
+        clients = {ip: SimpleNamespace(close=lambda: None) for ip in (leader, follower, master)}
+        for step, hosts, launches in [
+                ('config', [leader, follower, master], []),
+                ('master', [master], [('master', master)]),
+                ('chassis', [leader, follower, master], [('chassis', leader), ('chassis', follower)]),
+                ('follower', [follower, master], [('follower', follower)]),
+                ('monitor', [master], [])]:
+            with self.subTest(step=step):
+                workbench.events, workbench.monitor = queue.Queue(), None
+                def run(client, command, *args, **kwargs):
+                    if 'master --timeout 0.5' in command:
+                        raise RuntimeError('Master not yet running')
+                with patch.object(workbench, 'connect', side_effect=lambda ip, _: clients[ip]) as connect, \
+                     patch.object(workbench, 'stage', return_value='/tmp/stage'), \
+                     patch.object(workbench, 'launch') as launch, \
+                     patch.object(workbench, 'wait_ready') as ready, \
+                     patch('fleet_workbench.read_robot_config', return_value={'robot_id': 'ugv0'}) as read, \
+                     patch('fleet_workbench.update_config', return_value={}) as update, \
+                     patch('fleet_workbench.run_remote', side_effect=run) as remote, \
+                     patch('fleet_workbench.Monitor', return_value=SimpleNamespace(ready=True)) as monitor:
+                    workbench.run_start(step, options, rows, localization_config())
+                    self.assertEqual([call[0][0] for call in connect.call_args_list], hosts)
+                    self.assertEqual([call[0][:2] for call in launch.call_args_list], launches)
+                    self.assertEqual(ready.call_count, len(launches) if step != 'master' else 0)
+                    events = list(workbench.events.queue)
+                    self.assertFalse(any('失败' in str(event) for event in events), events)
+                    self.assertEqual(events[-1][0], 'done')
+                    if step == 'config':
+                        self.assertEqual(read.call_count, 2)
+                        self.assertEqual(update.call_count, 2)
+                        self.assertEqual(update.call_args_list[1][0][1]['UWB_PORT'], '/dev/ttyUSB7')
+                        self.assertEqual(update.call_args_list[1][0][1]['UGV_OFFSET_X'], '-2.0')
+                        remote.assert_not_called()
+                        monitor.assert_not_called()
+                        self.assertIn('配置检查完成', events[-1][1])
+                    else:
+                        read.assert_not_called()
+                        update.assert_not_called()
+                        self.assertFalse(any('SSH 配置检查中' in str(event) for event in events))
+                        if step in ('chassis', 'monitor'):
+                            monitor.assert_called_once()
+                            self.assertIn('--offsets \'{"2": [-1.2, 0.4]}\'', monitor.call_args[0][1])
+                        else:
+                            monitor.assert_not_called()
+
     def test_identity_write_readback_and_restart_record(self):
         text = 'export UGV_ID=2\nexport UWB_PORT=/dev/ttyUSB2\nexport UGV_OFFSET_Y=-0.8\nexport UGV_ID=3\n'
         updated = replace_setting(text, 'UGV_ID', 7)
@@ -167,18 +221,51 @@ class WorkbenchChecks(unittest.TestCase):
 
     def test_terminal_credentials_are_not_in_arguments(self):
         with patch('fleet_terminal.shutil.which', return_value='/usr/bin/gnome-terminal'), \
-             patch('fleet_terminal.subprocess.Popen') as popen:
+             patch.object(Terminal, '_tabs', set()), \
+             patch('fleet_terminal.subprocess.run', return_value=SimpleNamespace(
+                 stdout='GNOME_TERMINAL_SERVICE=:1.42\nGNOME_TERMINAL_SCREEN=/screen/first\n')) as run:
             terminal = Terminal('192.0.2.1', DEFAULTS, '/tmp/test-known-hosts', 'printf test', 'test')
             try:
-                args = popen.call_args[0][0]
+                args = run.call_args[0][0]
+                self.assertIn('--tab', args)
+                self.assertIn('--print-environment', args)
                 self.assertNotIn(DEFAULTS['password'], ' '.join(args))
                 request = terminal.directory / 'request.json'
                 self.assertEqual(request.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(json.loads(request.read_text())['options']['password'], DEFAULTS['password'])
                 terminal.stop()
                 self.assertTrue((terminal.directory / 'stop').exists())
+                second = Terminal('192.0.2.2', DEFAULTS, '/tmp/test-known-hosts', 'printf next', 'next')
+                try:
+                    environment = run.call_args[1]['env']
+                    self.assertEqual(environment['GNOME_TERMINAL_SERVICE'], ':1.42')
+                    self.assertEqual(environment['GNOME_TERMINAL_SCREEN'], '/screen/first')
+                finally:
+                    shutil.rmtree(second.directory)
             finally:
                 shutil.rmtree(terminal.directory)
+
+    def test_terminal_skips_closed_tabs_and_reopens_closed_window(self):
+        terminals = []
+        with patch('fleet_terminal.shutil.which', return_value='/usr/bin/gnome-terminal'), \
+             patch.object(Terminal, '_tabs', set()), \
+             patch('fleet_terminal.subprocess.run', side_effect=[SimpleNamespace(
+                 stdout='GNOME_TERMINAL_SERVICE=:1.42\nGNOME_TERMINAL_SCREEN=/screen/%d\n' % number)
+                 for number in range(4)]) as run:
+            try:
+                for _ in range(2):
+                    terminals.append(Terminal('192.0.2.1', DEFAULTS, '/tmp/test-known-hosts'))
+                (terminals[1].directory / 'status.json').write_text('{"state": "已关闭"}')
+                terminals.append(Terminal('192.0.2.1', DEFAULTS, '/tmp/test-known-hosts'))
+                self.assertEqual(run.call_args[1]['env']['GNOME_TERMINAL_SCREEN'], '/screen/0')
+                for terminal in terminals:
+                    (terminal.directory / 'status.json').write_text('{"state": "已关闭"}')
+                terminals.append(Terminal('192.0.2.1', DEFAULTS, '/tmp/test-known-hosts'))
+                self.assertNotIn('GNOME_TERMINAL_SCREEN', run.call_args[1]['env'])
+                self.assertNotIn('GNOME_TERMINAL_SERVICE', run.call_args[1]['env'])
+            finally:
+                for terminal in terminals:
+                    shutil.rmtree(terminal.directory)
 
     def test_leader_keyboard_events_and_stop_conditions(self):
         import tkinter as tk
@@ -361,16 +448,20 @@ class WorkbenchChecks(unittest.TestCase):
 
     def test_gui_tabs_map_pending_identity_and_aggregate_sync(self):
         import tkinter as tk
+        from tkinter import ttk
         try:
             root = tk.Tk()
         except tk.TclError:
             self.skipTest('No desktop session')
         root.withdraw()
         with tempfile.TemporaryDirectory() as directory, \
-             patch('fleet_console.connect_ssh', side_effect=AssertionError('Network forbidden in offline tests')):
+             patch('fleet_console.connect_ssh', side_effect=AssertionError('Network forbidden in offline tests')), \
+             patch.dict(ttk.__dict__):
+            ttk.__dict__.pop('Spinbox', None)  # Python 3.6 has tk.Spinbox only.
             app = FleetConsole(root, Path(directory) / 'settings.json')
             try:
                 wb = app.workbench
+                self.assertEqual(float(wb.limit_input.get()), 0.15)
                 ip = '192.168.0.106'
                 wb.limit_input.set('0.12')
                 wb.apply_limits()
@@ -409,6 +500,19 @@ class WorkbenchChecks(unittest.TestCase):
                 wb.monitor = None
                 self.assertEqual([app.notebook.tab(tab, 'text') for tab in app.notebook.tabs()],
                                  ['扫描与连接', '编队算法', '小车定位图'])
+                page = root.nametowidget(app.notebook.tabs()[1])
+                steps = next(widget for widget in page.winfo_children() if isinstance(widget, ttk.Notebook))
+                self.assertEqual([steps.tab(tab, 'text') for tab in steps.tabs()],
+                                 ['1 · 配置检查', '2 · Master', '3 · 底盘与定位', '4 · 跟随算法', '5 · 监视与使能'])
+                with patch.object(wb, 'start') as start:
+                    for tab, action in zip(steps.tabs(), ('config', 'master', 'chassis', 'follower', 'monitor')):
+                        frame = root.nametowidget(tab)
+                        buttons = next(widget for widget in frame.winfo_children() if isinstance(widget, ttk.Frame))
+                        buttons.winfo_children()[0].invoke()
+                        start.assert_called_with(action)
+                steps.select(4)
+                root.update()
+                self.assertEqual(app.vars['formation_step'].get(), '4')
                 with patch.object(app, 'selected_action') as action:
                     wb.vehicles.selection_set('192.168.0.106')
                     wb.serial_permissions()

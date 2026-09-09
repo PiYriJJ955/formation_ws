@@ -38,6 +38,7 @@ python3 scripts/fleet_console.py
 ```
 
 本机 Ubuntu 20.04 已验证 X11、Tk 8.6 与 Paramiko 可用；Ubuntu 18.04 尚未完整实测。
+已使用 Python 3.6.9 通过完整三页界面、扫描与控制操作的离线测试。
 `requirements.txt` 包含 Paramiko 和 PyYAML；Tk 与 GNOME Terminal 通过系统包安装。
 主机控制界面不依赖本机 ROS。
 车端需要已经编译的工作空间、ROS 环境和可读写的 `/dev/wheeltec_controller`。
@@ -125,20 +126,24 @@ python3 test/test_fleet_console.py
    结束后弹窗逐车显示结果。同步的是 HTTP 仓库已发布的 `master`；主机尚未提交 / push 的
    工作区修改需要先按下方“发布和更新”发布。运行中的 ROS 任务会阻止安装更新，需先停止。
 3. 用“编辑选中车 UWB 串口 / 编队偏移”配置新车的真实串口和跟随偏移。串口、偏移
-   沿用车端配置；保存的自定义值在下次启动步骤中自动 SSH 写回 `robot.env`。
+   沿用车端配置；保存的自定义值在执行“配置检查”或“快捷总启动”时通过 SSH 写回 `robot.env`。
    在第三页检查基站坐标和标签高度。车辆启动时朝向 UWB 地图 +X，供现有算法初始化航向。
 4. 点击“快捷总启动”。程序停止控制台原先的独立底盘，关闭自动启动和循环扫描，然后依次
    同步所选车辆编号 / Master / ROS_IP / mini_4wd → 检查或启动 Master → 启动各车底盘与 UWB
    定位 → 启动跟随控制器 → 连接实时监视。Master IP 对应主机也需能使用同一 SSH 设置登录，
    且已安装工作空间。各车等待真实里程计和有效 UWB 数据，最长 45 秒；失败保留已经打开的
    终端供检查，后续步骤停止，结果弹窗说明失败的车辆。
-5. 总启动完成时跟随尚未使能。先在第三页确认位置，在第二页“4 · 监视与使能”点击
+5. 总启动完成时跟随尚未使能。先在第三页确认位置，在第二页“5 · 监视与使能”点击
    “使能编队跟随”。跟随车会朝各自目标行驶。定位无效、过期或线速度上限尚未确认时按钮拒绝使能，控制器自身
    也会检查输入是否及时。
 
-下方的四个步骤页签可以单独执行，便于排查配置 / Master、底盘 / UWB、跟随控制器或监视问题。
-`roscore` 和 `roslaunch` 都运行在可见的 GNOME SSH 终端中；Ctrl+C 停止当前命令后会进入
-可输入命令的 SSH shell。启动日志区域可以折叠，终端窗口也可正常最小化。
+下方五个步骤页签依次是“配置检查 / Master / 底盘与定位 / 跟随算法 / 监视与使能”，可以单独执行。
+首次使用或修改车端配置后，先运行“检查并同步配置”；该步骤完成配置同步和启动文件上传。
+单独启动 Master、底盘、跟随或监视时直接使用已有配置，保留对应的 ROS 就绪检查。
+单独连接监视只登录 Master，编队偏移使用界面最近一次读取的车端值。
+`roscore`、`roslaunch` 和手动 SSH 会话通过 GNOME Terminal 标签页打开，控制台后续会话复用同一终端窗口，
+窗口关闭后自动新建。标签标题显示车辆、IP 和任务；Ctrl+C 停止当前命令后会进入
+可输入命令的 SSH shell。启动日志区域可以折叠，终端窗口也可统一最小化。
 已有 Master 会直接接入；重复串口占用或已有同名控制器会报错，便于先结束原来的启动任务。
 更改参与车辆、Master、领航车或定位设置后，先停止本次启动，再用新设置启动。
 
@@ -207,7 +212,7 @@ GUI 和 ROS 通信的离线检查命令：
 python3 test/test_fleet_console.py
 python3 test/test_fleet_workbench.py
 python3 test/test_leader_tracker.py  # 直线、折线转弯、限速和暂停恢复模拟
-python3 test/test_fleet_terminal.py  # 回环 SSH 测试，会短暂打开一个测试终端
+python3 test/test_fleet_terminal.py  # 回环 SSH 测试，在同一窗口短暂打开两个测试标签页
 source scripts/env.sh
 python3 test/test_fleet_launch.py
 python3 test/test_fleet_ros.py   # 仅启动回环地址 ROS Master 和模拟发布器，不启动底盘

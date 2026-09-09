@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -17,14 +18,14 @@ from fleet_terminal import Terminal
 
 
 def main():
-    stop, finish_command, shell_open = threading.Event(), threading.Event(), threading.Event()
-    executed = []
+    stop, finish_command = threading.Event(), threading.Event()
+    executed, shells = [], []
     server = socket.socket()
     server.bind(('127.0.0.1', 0))
     server.listen(1)
     server.settimeout(1)
     key = paramiko.RSAKey.generate(2048)
-    transport = [None]
+    transports = []
     class SSHServer(paramiko.ServerInterface):
         def check_auth_password(self, username, password):
             return paramiko.AUTH_SUCCESSFUL if (username, password) == ('offline-test', 'test-token') else paramiko.AUTH_FAILED
@@ -37,9 +38,10 @@ def main():
             executed.append(command.decode())
             return True
         def check_channel_shell_request(self, channel):
-            shell_open.set()
+            shells.append(channel)
             return True
     def serve():
+        ssh = None
         try:
             while not stop.is_set():
                 try:
@@ -49,7 +51,8 @@ def main():
                     continue
             else:
                 return
-            ssh = transport[0] = paramiko.Transport(connection)
+            ssh = paramiko.Transport(connection)
+            transports.append(ssh)
             ssh.add_server_key(key)
             ssh.start_server(server=SSHServer())
             channel = ssh.accept(10)
@@ -75,44 +78,55 @@ def main():
         except EOFError:
             pass  # The terminal can close its transport before the server sends EOF.
         finally:
-            if transport[0]:
-                transport[0].close()
-    thread = threading.Thread(target=serve, daemon=True)
-    thread.start()
-    terminal = None
+            if ssh:
+                ssh.close()
+    threads = [threading.Thread(target=serve, daemon=True) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    terminals = []
     with tempfile.TemporaryDirectory() as directory:
         try:
             options = dict(DEFAULTS, username='offline-test', password='test-token', port=str(server.getsockname()[1]))
-            terminal = Terminal('127.0.0.1', options, Path(directory) / 'known_hosts',
-                                'printf offline-test', 'Formation offline terminal check')
+            for number in range(2):
+                terminals.append(Terminal('127.0.0.1', options, Path(directory) / ('known_hosts_%d' % number),
+                                          'printf offline-test', 'Formation offline terminal check %d' % number))
             deadline = time.monotonic() + 12
-            while terminal.status()['state'] != '运行中':
+            while any(terminal.status()['state'] != '运行中' for terminal in terminals):
                 if time.monotonic() > deadline:
-                    raise AssertionError(terminal.status())
+                    raise AssertionError([terminal.status() for terminal in terminals])
                 time.sleep(0.05)
-            assert executed and 'printf offline-test' in executed[0], executed
-            assert not (terminal.directory / 'request.json').exists(), 'Credentials must be consumed'
+            assert len(executed) == 2 and all('printf offline-test' in command for command in executed), executed
+            for terminal in terminals:
+                assert not (terminal.directory / 'request.json').exists(), 'Credentials must be consumed'
+            if os.environ.get('DISPLAY') and shutil.which('xwininfo'):
+                windows = subprocess.check_output(['xwininfo', '-root', '-tree'], universal_newlines=True)
+                windows = [line for line in windows.splitlines() if 'Formation offline terminal check' in line]
+                assert len(windows) == 1, windows
             finish_command.set()
-            assert shell_open.wait(5), 'A finished command must leave an interactive SSH shell'
-            terminal.stop()
+            deadline = time.monotonic() + 5
+            while len(shells) < 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert len(shells) == 2, 'Finished commands must leave interactive SSH shells'
+            for terminal in terminals:
+                terminal.stop()
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
-                status = terminal.status()
-                if status['state'] == '已关闭':
+                if all(terminal.status()['state'] == '已关闭' for terminal in terminals):
                     break
                 time.sleep(0.1)
-            assert terminal.status()['state'] == '已关闭', terminal.status()
-            print('Native GNOME terminal passed: loopback SSH login, visible exec, interactive shell, stop and credential-file removal.')
+            assert all(terminal.status()['state'] == '已关闭' for terminal in terminals), [t.status() for t in terminals]
+            print('Native GNOME terminal passed: two SSH tabs in one window, visible exec, interactive shells, stop and credential-file removal.')
         finally:
             finish_command.set()
-            if terminal:
+            for terminal in terminals:
                 terminal.stop()
             stop.set()
-            if transport[0]:
-                transport[0].close()
+            for transport in transports:
+                transport.close()
             server.close()
-            thread.join(2)
-            if terminal:
+            for thread in threads:
+                thread.join(2)
+            for terminal in terminals:
                 shutil.rmtree(terminal.directory)
 
 

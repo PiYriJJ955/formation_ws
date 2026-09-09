@@ -69,7 +69,7 @@ def expand_addresses(spec):
             network = ipaddress.IPv4Network(token, strict=False)
             if network.num_addresses > 4096:
                 raise ValueError('单段范围最多 4096 个地址')
-            addresses = network.hosts()
+            addresses = [network.network_address] if network.prefixlen == 32 else network.hosts()
         elif '-' in token:
             first, last = token.split('-', 1)
             if '.' not in last:
