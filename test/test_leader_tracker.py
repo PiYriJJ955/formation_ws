@@ -66,9 +66,17 @@ class TrackingChecks(unittest.TestCase):
 
     def test_path_validation_and_local_progress(self):
         self.assertEqual(parse_points('0, 0\n1 0\n1, 1'), [(0, 0), (1, 0), (1, 1)])
+        self.assertEqual(parse_points(u'0\uff0c0\n1\uff0c1'), [(0, 0), (1, 1)])
+        self.assertEqual(parse_points('', min_points=0), [])
+        self.assertEqual(parse_points('1, 2', min_points=0), [(1, 2)])
+        with self.assertRaises(ValueError) as error:
+            parse_points('0, 0\n0.01, 0')
+        self.assertEqual(str(error.exception), 'PATH_SEGMENT_SHORT')
         for text in ('', '0, 0', '0, 0\nnan, 1', '0 0 0\n1 1', '0 0\n0.01 0'):
             with self.assertRaises(ValueError):
                 parse_points(text)
+        with self.assertRaises(ValueError):
+            parse_points('\n'.join('%s, 0' % n for n in range(51)), min_points=0)
         check_bounds([(1.5, 2), (3, 2)], (0, 0, 6.4, 4.4), [(0.8, 0.8)])
         with self.assertRaises(ValueError):
             check_bounds([(0.5, 2), (3, 2)], (0, 0, 6.4, 4.4), [(0.8, 0.8)])

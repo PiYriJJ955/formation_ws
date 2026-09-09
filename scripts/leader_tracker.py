@@ -22,16 +22,17 @@ def wrap(angle):
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
-def parse_points(text):
+def parse_points(text, min_points=2):
     try:
-        return validate_points([[float(v) for v in line.replace(',', ' ').split()]
-                                for line in text.splitlines() if line.strip()])
+        points = [[float(v) for v in line.replace(',', ' ').replace(u'\uff0c', ' ').split()]
+                  for line in text.splitlines() if line.strip()]
     except (TypeError, ValueError):
         raise ValueError('PATH_POINTS')
+    return validate_points(points, min_points=min_points)
 
 
-def validate_points(points):
-    if not isinstance(points, (list, tuple)) or not 2 <= len(points) <= 50:
+def validate_points(points, min_points=2):
+    if not isinstance(points, (list, tuple)) or not min_points <= len(points) <= 50:
         raise ValueError('PATH_POINTS')
     result = []
     for point in points:

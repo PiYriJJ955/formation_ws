@@ -699,9 +699,19 @@ class WorkbenchChecks(unittest.TestCase):
                           if w.winfo_class() == 'TRadiobutton']
                 radios[1].invoke()
                 self.assertEqual(wb.monitor.control_request['action'], 'path')
+                wb.begin_path_pick()
+                root.update()
+                self.assertEqual(wb.control_dialog.state(), 'withdrawn')
+                wb.edit_path('clear')
                 wb.use_current_start()
+                self.assertEqual(len(wb.canvas.find_withtag('path_point')), 1)
+                ox, oy, scale = wb.map_transform
+                wb.canvas.event_generate('<Button-1>', x=round(ox + 3 * scale), y=round(oy - 2.2 * scale))
+                wb.open_leader_control()
                 points = wb.preview_path()
                 self.assertEqual(points[0], (2.1, 2.2))
+                self.assertAlmostEqual(points[1][0], 3, delta=1 / scale)
+                self.assertAlmostEqual(points[1][1], 2.2, delta=1 / scale)
                 self.assertTrue(wb.canvas.find_withtag('reference_path'))
                 wb.trajectory_action('start')
                 self.assertEqual(wb.monitor.control_request['action'], 'start')
@@ -719,6 +729,99 @@ class WorkbenchChecks(unittest.TestCase):
                 app.vars['leader'].set('ugv2')
                 wb.poll()
                 self.assertEqual(wb.monitor.control_request['action'], 'stop')
+            finally:
+                app.closing = True
+                for timer in root.tk.splitlist(root.tk.call('after', 'info')):
+                    root.after_cancel(timer)
+                root.destroy()
+
+    def test_map_path_editing_coordinates_validation_and_resize(self):
+        import tkinter as tk
+        from leader_tracker import parse_points
+        try:
+            root = tk.Tk()
+        except tk.TclError:
+            self.skipTest('No desktop session')
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('fleet_console.connect_ssh', side_effect=AssertionError('Offline test')):
+            app = FleetConsole(root, Path(directory) / 'settings.json')
+            wb = app.workbench
+            try:
+                config = localization_config()
+                anchors = [dict(a, x=a['x']-4, y=a['y']-3) for a in config['anchors']]
+                app.vars['anchors_json'].set(json.dumps(dict(anchors=anchors, tag_height=config['tag_height'])))
+                app.vars['leader_control_mode'].set('path')
+                app.vars['leader_path'].set('')
+                # Last telemetry from a disconnected run must not hide the draft.
+                wb.tracking = {'state': 'TRACKING', 'points': [(0, 0), (1, 0)]}
+                wb.open_leader_control()
+                wb.begin_path_pick()
+                root.update()
+
+                def click(x, y):
+                    ox, oy, scale = wb.map_transform
+                    wb.canvas.event_generate('<Button-1>', x=round(ox+x*scale), y=round(oy-y*scale))
+                    root.update()
+                    return scale
+
+                scale = click(-2, -1)
+                self.assertEqual(len(wb.path_preview), 1)
+                self.assertAlmostEqual(wb.path_preview[0][0], -2, delta=1/scale)
+                self.assertAlmostEqual(wb.path_preview[0][1], -1, delta=1/scale)
+                self.assertEqual(len(wb.canvas.find_withtag('path_point')), 1)
+                self.assertFalse(wb.canvas.find_withtag('reference_path'))
+                click(-2, -1)
+                self.assertIn('0.15 m', wb.path_pick_status.get())
+                self.assertEqual(len(wb.path_preview), 1)
+                click(-4, -1)
+                self.assertIn('范围', wb.path_pick_status.get())
+                self.assertEqual(len(wb.path_preview), 1)
+                wb.use_current_start()
+                self.assertIn('定位无效或过期', wb.path_pick_status.get())
+                self.assertEqual(len(wb.path_preview), 1)
+
+                previous_transform = wb.map_transform
+                root.geometry('1050x700')
+                root.update()
+                self.assertNotEqual(wb.map_transform, previous_transform)
+                scale = click(1, 0.5)
+                self.assertEqual(len(wb.path_preview), 2)
+                self.assertAlmostEqual(wb.path_preview[1][0], 1, delta=1/scale)
+                self.assertAlmostEqual(wb.path_preview[1][1], 0.5, delta=1/scale)
+                self.assertTrue(wb.canvas.find_withtag('reference_path'))
+                self.assertEqual(parse_points(app.vars['leader_path'].get()), wb.path_preview)
+                wb.canvas.event_generate('<Button-3>')
+                self.assertEqual(len(wb.path_preview), 1)
+                wb.edit_path('clear')
+                self.assertEqual(wb.path_preview, [])
+                self.assertEqual(app.vars['leader_path'].get(), '')
+                self.assertFalse(wb.canvas.find_withtag('path_point'))
+                self.assertFalse(wb.canvas.find_withtag('reference_path'))
+                click(-2, -1)
+                click(1, 0.5)
+                wb.open_leader_control()
+                root.update()
+                self.assertFalse(wb.path_picking)
+                self.assertEqual(wb.control_dialog.state(), 'normal')
+                self.assertFalse(wb.path_tools.winfo_ismapped())
+                before = list(wb.path_preview)
+                click(0, 0)
+                self.assertEqual(wb.path_preview, before)
+                app.save()
+                options, _ = load_settings(app.config_path)
+                self.assertEqual(parse_points(options['leader_path']), before)
+                wb.close_control_dialog()
+                wb.open_leader_control()
+                self.assertEqual(parse_points(wb.path_editor.get('1.0', 'end-1c')), before)
+
+                wb.monitor = SimpleNamespace(ready=True, tracking={'state': 'TRACKING'})
+                with patch.object(app.messagebox, 'showerror') as error:
+                    wb.begin_path_pick()
+                    error.assert_called_once()
+                    self.assertIn('先暂停', error.call_args[0][1])
+                self.assertFalse(wb.path_picking)
+                self.assertEqual(wb.path_preview, before)
+                wb.monitor = None
             finally:
                 app.closing = True
                 for timer in root.tk.splitlist(root.tk.call('after', 'info')):

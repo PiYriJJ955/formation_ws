@@ -233,6 +233,7 @@ class FleetWorkbench:
         self.active_offsets = {}
         self.control_dialog = self.keyboard = None
         self.path_preview, self.tracking = [], {}
+        self.path_picking, self.map_transform = False, None
         self.keys_down, self.key_releases = set(), {}
         self.keyboard_keys = set()
         self.run_id = uuid.uuid4().hex
@@ -868,6 +869,7 @@ class FleetWorkbench:
             self.monitor.control_request = dict(values, sequence=previous['sequence']+1, action=action)
 
     def close_control_dialog(self):
+        self.set_path_picking(False)
         self.armed.set(False)
         self.send_control('pause' if self.app.vars['leader_control_mode'].get() == 'path' else 'stop')
         if self.control_dialog:
@@ -875,13 +877,15 @@ class FleetWorkbench:
             self.control_dialog = self.keyboard = None
 
     def open_leader_control(self):
+        self.set_path_picking(False)
         if self.control_dialog and self.control_dialog.winfo_exists():
+            self.control_dialog.deiconify()
             self.control_dialog.lift()
             return
         dialog = self.control_dialog = self.tk.Toplevel(self.root)
         dialog.title('领航控制')
         dialog.transient(self.root)
-        dialog.geometry('720x450')
+        dialog.geometry('720x490')
         dialog.protocol('WM_DELETE_WINDOW', self.close_control_dialog)
         dialog.bind('<Escape>', lambda _: self.emergency())
         top = self.ttk.Frame(dialog, padding=10)
@@ -913,7 +917,7 @@ class FleetWorkbench:
         self.keyboard.bind('<FocusOut>', lambda _: self.armed.set(False))
         self.ttk.Label(keyboard, text='W / ↑ 前进；S / ↓ 后退；A / ← 左转；D / → 右转。\n可组合按键，例如 W+A 边前进边左转；松开一个键保留另一方向。\n同轴反向键抵消，全部松开停车；失焦后需重新启用。空格 / Esc 停车。').pack(anchor='w', pady=12)
         self.ttk.Label(keyboard, textvariable=self.keyboard_status, wraplength=650).pack(fill='x')
-        self.ttk.Label(path, text='折线坐标（UWB 地图，单位米）：每行 X, Y，按顺序连接；至少两点。').pack(anchor='w')
+        self.ttk.Label(path, text='可在地图上选点，或每行填写 X, Y（UWB 坐标，单位米）；至少两点。').pack(anchor='w')
         self.path_editor = self.tk.Text(path, height=5, width=40)
         self.path_editor.pack(fill='x', pady=5)
         self.path_editor.insert('1.0', self.app.vars['leader_path'].get())
@@ -922,6 +926,12 @@ class FleetWorkbench:
                 self.app.vars['leader_path'].set(self.path_editor.get('1.0', 'end-1c'))
                 self.path_editor.edit_modified(False)
         self.path_editor.bind('<<Modified>>', remember)
+        edit = self.ttk.Frame(path)
+        edit.pack(fill='x', pady=4)
+        for label, command in [('地图选点', self.begin_path_pick),
+                               ('撤销末点', lambda: self.edit_path('undo')),
+                               ('清空路径', lambda: self.edit_path('clear'))]:
+            self.ttk.Button(edit, text=label, command=command).pack(side='left', padx=(0, 8))
         fields = self.ttk.Frame(path)
         fields.pack(fill='x', pady=5)
         self.ttk.Button(fields, text='使用当前位置为起点', command=self.use_current_start).pack(side='left', padx=(0, 10))
@@ -939,26 +949,93 @@ class FleetWorkbench:
         switch(False)
 
     def use_current_start(self):
+        self.edit_path('current')
+
+    def check_path_editable(self):
+        if self.monitor and self.monitor.ready:
+            tracking = getattr(self.monitor, 'tracking', {})
+            request = getattr(self.monitor, 'control_request', {})
+            if (self.tracking.get('state') in ('TRACKING', 'ALIGNING') or
+                    tracking.get('state') in ('TRACKING', 'ALIGNING') or
+                    (request.get('action') in ('start', 'resume') and
+                     request.get('sequence', 0) > tracking.get('ack', -1))):
+                raise ValueError('请先暂停，再编辑、预览或开始新路径')
+
+    def set_path_picking(self, enabled):
+        self.path_picking = enabled
+        self.canvas.configure(cursor='crosshair' if enabled else '')
+        if enabled:
+            self.path_tools.pack(fill='x', before=self.canvas, pady=5)
+        else:
+            self.path_tools.pack_forget()
+
+    def begin_path_pick(self):
         try:
-            error = self.keyboard_connection_error(time.monotonic())
-            if error:
-                raise ValueError(error)
-            number = str(robot_number(self.app.vars['leader'].get()))
-            if not self.fresh(number, time.monotonic()):
-                raise ValueError('领航车定位无效或过期')
-            x, y = self.samples[number]['pose']['value']
-            lines = self.path_editor.get('1.0', 'end-1c').splitlines()
-            lines = ['%.4f, %.4f' % (x, y)] + lines[1:]
-            self.path_editor.delete('1.0', 'end')
-            self.path_editor.insert('1.0', '\n'.join(lines))
-            self.app.vars['leader_path'].set('\n'.join(lines))
+            self.check_path_editable()
         except ValueError as error:
-            self.app.messagebox.showerror('当前位置', str(error), parent=self.control_dialog)
+            self.app.messagebox.showerror('参考路径', str(error), parent=self.control_dialog)
+            return
+        self.armed.set(False)
+        self.path_pick_status.set('左键按顺序添加点，右键撤销末点；选好后点击“完成选点”。')
+        try:
+            self.path_preview = parse_points(self.path_editor.get('1.0', 'end-1c'), min_points=0)
+        except ValueError as error:
+            self.path_preview = []
+            self.path_pick_status.set(TRACKING_TEXT.get(str(error), str(error)) + '；可清空路径后重新选点。')
+        self.app.notebook.select(self.canvas.master)
+        self.set_path_picking(True)
+        self.control_dialog.withdraw()
+        self.paint_map(time.monotonic())
+
+    def edit_path(self, action, point=None):
+        try:
+            self.check_path_editable()
+            lines = [line for line in self.path_editor.get('1.0', 'end-1c').splitlines() if line.strip()]
+            if action == 'clear':
+                lines = []
+            elif action == 'undo':
+                lines = lines[:-1]
+            elif action == 'append':
+                lines.append('%.4f, %.4f' % point)
+            elif action == 'current':
+                number = str(robot_number(self.app.vars['leader'].get()))
+                if not self.fresh(number, time.monotonic()):
+                    raise ValueError('领航车定位无效或过期，请连接实时监视')
+                lines = ['%.4f, %.4f' % tuple(self.samples[number]['pose']['value'])] + lines[1:]
+            points = parse_points('\n'.join(lines), min_points=0)
+            if action in ('append', 'current'):
+                config = localization_config(self.app.vars['anchors_json'].get())
+                offsets = list(self.active_offsets.values()) if self.monitor and self.monitor.enable else []
+                check_bounds(points, path_bounds(config), offsets)
+            text = '\n'.join('%.4f, %.4f' % p for p in points)
+            self.path_editor.delete('1.0', 'end')
+            self.path_editor.insert('1.0', text)
+            self.app.vars['leader_path'].set(text)
+            self.path_preview = points
+            self.path_pick_status.set('已选 %d 个点；左键添加，右键撤销。%s' %
+                                      (len(points), '至少需要两点。' if len(points) < 2 else '选好后点击“完成选点”。'))
+            self.paint_map(time.monotonic())
+        except ValueError as error:
+            message = TRACKING_TEXT.get(str(error), str(error))
+            if self.path_picking:
+                self.path_pick_status.set(message)
+            else:
+                self.app.messagebox.showerror('参考路径', message, parent=self.control_dialog)
+
+    def map_path_click(self, event):
+        self.canvas.focus_set()
+        if not self.path_picking:
+            return
+        if event.num == 3:
+            self.edit_path('undo')
+        elif self.map_transform:
+            ox, oy, scale = self.map_transform
+            self.edit_path('append', ((self.canvas.canvasx(event.x) - ox) / scale,
+                                      (oy - self.canvas.canvasy(event.y)) / scale))
 
     def preview_path(self):
         try:
-            if self.monitor and self.monitor.ready and self.tracking.get('state') in ('TRACKING', 'ALIGNING'):
-                raise ValueError('请先暂停，再预览或开始新路径')
+            self.check_path_editable()
             points = parse_points(self.path_editor.get('1.0', 'end-1c'))
             config = localization_config(self.app.vars['anchors_json'].get())
             offsets = list(self.active_offsets.values()) if self.monitor and self.monitor.enable else []
@@ -1022,7 +1099,19 @@ class FleetWorkbench:
         self.ttk.Label(page, text='三角形：基站　圆点：车辆　实线：实际轨迹　虚线：目标 / 误差　紫色虚线：参考路径　灰色：定位过期或无效').pack(anchor='w')
         self.canvas = self.tk.Canvas(page, background='#f7fafc', highlightthickness=0, takefocus=True)
         self.canvas.pack(fill='both', expand=True)
-        self.canvas.bind('<Button-1>', lambda _: self.canvas.focus_set())
+        self.canvas.bind('<Button-1>', self.map_path_click)
+        self.canvas.bind('<Button-3>', self.map_path_click)
+        self.canvas.bind('<Configure>', lambda _: self.paint_map(time.monotonic()))
+        self.path_tools = self.ttk.Frame(page)
+        buttons = self.ttk.Frame(self.path_tools)
+        buttons.pack(fill='x')
+        for label, command in [('完成选点', self.open_leader_control),
+                               ('使用当前位置为起点', self.use_current_start),
+                               ('撤销末点', lambda: self.edit_path('undo')),
+                               ('清空路径', lambda: self.edit_path('clear'))]:
+            self.ttk.Button(buttons, text=label, command=command).pack(side='left', padx=(0, 8))
+        self.path_pick_status = self.tk.StringVar()
+        self.ttk.Label(self.path_tools, textvariable=self.path_pick_status, wraplength=1080).pack(anchor='w', pady=4)
         self.metrics = self.tk.StringVar(value='三角形：基站　圆点：车辆　十字：跟踪目标　虚线：位置误差　灰色：定位无效 / 数据过期')
         self.ttk.Label(page, textvariable=self.metrics, wraplength=1080).pack(fill='x', pady=6)
 
@@ -1112,7 +1201,10 @@ class FleetWorkbench:
         config = localization_config(self.app.vars['anchors_json'].get())
         anchors = config['anchors']
         points = [(a['x'], a['y']) for a in anchors]
-        path = self.tracking.get('points', []) if self.tracking.get('state') in ('TRACKING', 'ALIGNING') else self.path_preview
+        path = self.path_preview
+        if (not self.path_picking and self.monitor and self.monitor.ready and
+                self.tracking.get('state') in ('TRACKING', 'ALIGNING')):
+            path = self.tracking.get('points', [])
         points.extend(path)
         for row in self.samples.values():
             for key in ('pose', 'target'):
@@ -1121,9 +1213,10 @@ class FleetWorkbench:
         xmin, xmax = min(p[0] for p in points) - 1, max(p[0] for p in points) + 1
         ymin, ymax = min(p[1] for p in points) - 1, max(p[1] for p in points) + 1
         scale = min((width - 90) / max(1, xmax - xmin), (height - 65) / max(1, ymax - ymin))
+        ox, oy = width / 2 - (xmin + xmax) / 2 * scale, height / 2 + (ymin + ymax) / 2 * scale
+        self.map_transform = (ox, oy, scale)
         def xy(point):
-            return (width / 2 + (point[0] - (xmin + xmax) / 2) * scale,
-                    height / 2 - (point[1] - (ymin + ymax) / 2) * scale)
+            return ox + point[0] * scale, oy - point[1] * scale
         canvas.delete('all')
         grid_step = max(1, math.ceil(max(xmax - xmin, ymax - ymin) / 25))
         for x in range(math.floor(xmin), math.ceil(xmax) + 1, grid_step):
@@ -1142,9 +1235,10 @@ class FleetWorkbench:
             canvas.create_text(x, y - 20, text='A%s · z=%.2f' % (a['id'], a['z']), fill='#334155')
         if len(path) > 1:
             canvas.create_line(*[v for point in path for v in xy(point)], fill='#7c3aed', width=2, dash=(8, 4), tags='reference_path')
-            for index, point in enumerate(path):
-                x, y = xy(point)
-                canvas.create_text(x+5, y-10, text='P%d' % index, fill='#7c3aed', anchor='w')
+        for index, point in enumerate(path):
+            x, y = xy(point)
+            canvas.create_oval(x-4, y-4, x+4, y+4, fill='#7c3aed', outline='white', tags='path_point')
+            canvas.create_text(x+5, y-10, text='P%d' % index, fill='#7c3aed', anchor='w')
         lookahead = self.tracking.get('target')
         if lookahead and now-self.last_sample < 0.6 and self.tracking.get('mode') == 'path':
             x, y = xy(lookahead)
