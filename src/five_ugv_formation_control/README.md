@@ -71,7 +71,7 @@ UGV0 静止要求原始里程计平移速度和角速度连续 `stationary_durat
 | `hold_enter_duration` | 0.4 s | 连续到达且静止的确认时间 |
 | `heading_tolerance` | 0.08727 rad（5°） | 同步航向死区 |
 | `hold_max_angular` | 0.35 rad/s | 保持角速度上限 |
-| `data_timeout` | 0.6 s | 两车位姿、速度的源时间年龄及 valid 接收年龄上限 |
+| `data_timeout` | 0.6 s | 两车位姿、速度及 valid 的接收超时阈值 |
 | `prediction_limit` | 0.20 s | 位置、航向的最大外推时间 |
 | `velocity_filter_tau` | 0.15 s | 里程计速度滤波时间常数 |
 | `stationary_duration` | 0.4 s | 静止确认时间 |
@@ -87,10 +87,10 @@ UGV0 静止要求原始里程计平移速度和角速度连续 `stationary_durat
 ## UWB 与 odom 航向对齐
 
 先完成 UWB 定位初始化，再让两车保持静止至少 `stationary_duration`。默认使用有效 UWB pose
-的 orientation，在对应源时间插值 odom 航向，然后捕获固定偏移：
+的 orientation，按本机接收时间插值 odom 航向，然后捕获固定偏移：
 
 ```text
-yaw_offset = yaw_from_uwb_pose - yaw_odom_at_uwb_stamp
+yaw_offset = yaw_from_uwb_pose - yaw_odom_at_uwb_receive_time
 yaw_uwb = yaw_odom + yaw_offset
 ```
 
@@ -100,11 +100,11 @@ yaw_uwb = yaw_odom + yaw_offset
 此方法与领航路径控制使用同一 UWB 地图航向基准，不把跟随器启动朝向置零。
 UWB 定位器自身的初始朝向要求仍需满足；单标签静止时不能凭距离独立测出绝对航向。
 
-两车 `/uwb/pose`、`/odom_combined`、`/odom` 必须有有效源时间戳，且各主机时钟同步。
-过期、未来、重复和乱序帧不刷新有效输入时间；`valid` 无 header，按接收时间监测。
-控制器使用里程计短时恒速运动模型向当前时刻外推，最多 `prediction_limit` 秒；
-超出外推上限的剩余延迟仍可能造成误差，这不等同于严格传感器同步。
-UWB 源时刻无法与航向历史在外推范围内对应时，以 `INPUT_TIME_SKEW` 停车。
+两车输入统一按本机接收时间判断新鲜度、记录航向历史和计算短时外推。
+`data_timeout` 检测有效数据接收中断；非法数值和 UWB 无效仍触发停车。
+使用里程计恒速模型从接收时刻向当前时刻外推，最多 `prediction_limit` 秒；
+此方式不能识别或补偿消息到达前的链路延迟。
+UWB 接收时刻无法与航向历史在外推范围内对应时，以 `INPUT_TIME_SKEW` 停车。
 
 ## 编译与运行
 
@@ -214,7 +214,7 @@ python src/five_ugv_formation_control/scripts/displacement_follower.py --self-te
 python test/test_fleet_launch.py
 ```
 
-自测不连接 ROS Master。覆盖源时间保护、航向标定、限速、静止目标及身后目标收敛、
+自测不连接 ROS Master。覆盖接收超时保护、源时钟偏差、航向标定、限速、静止目标及身后目标收敛、
 恒曲率零误差跟踪，以及左右圆弧、S 弯、领航原地旋转两侧共 8 个闭环场景。
 动态场景加入 150 ms 输入延迟、约 1.2 cm 位置噪声、200 ms 底盘响应滞后，
 输出稳定段 RMS、P95、转向换向次数和停车样本数。模拟结果不能替代实车验证。

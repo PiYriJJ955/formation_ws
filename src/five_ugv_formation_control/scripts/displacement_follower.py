@@ -67,7 +67,7 @@ def advance_pose(x, y, yaw, velocity, dt):
 
 
 class RobotState(object):
-    """Source-stamped state, shared by leader and follower input handling."""
+    """Receive-stamped state, shared by leader and follower input handling."""
     def __init__(self, offset):
         self.offset = offset
         self.pose = self.pose_stamp = self.velocity_stamp = None
@@ -248,19 +248,19 @@ class DisplacementFollower(object):
         rospy.Timer(rospy.Duration(1.0/self.rate), self.control_cb)
 
     def accept_stamp(self, stamp, previous):
-        return (stamp.to_sec() > 0 and self.fresh(stamp, rospy.Time.now()) and
-                (previous is None or stamp > previous))
+        return previous is None or stamp > previous
 
     def pose_cb(self, msg, robot):
         with self.lock:
-            if not self.accept_stamp(msg.header.stamp, robot.pose_stamp):
+            stamp = rospy.Time.now()
+            if not self.accept_stamp(stamp, robot.pose_stamp):
                 return
             x, y = msg.pose.position.x, msg.pose.position.y
             if not isfinite(x) or not isfinite(y):
                 robot.pose_stamp = None
                 return
             robot.pose = (x, y, quaternion_to_yaw(msg.pose.orientation))
-            robot.pose_stamp = msg.header.stamp
+            robot.pose_stamp = stamp
 
     def valid_cb(self, msg, robot):
         with self.lock:
@@ -271,25 +271,27 @@ class DisplacementFollower(object):
 
     def odom_cb(self, msg, robot):
         with self.lock:
+            stamp = rospy.Time.now()
             previous = robot.headings[-1][0] if robot.headings else None
-            if not self.accept_stamp(msg.header.stamp, previous):
+            if not self.accept_stamp(stamp, previous):
                 return
             yaw = quaternion_to_yaw(msg.pose.pose.orientation)
             if yaw is None:
                 robot.headings.clear()
                 return
-            robot.headings.append((msg.header.stamp, yaw))
+            robot.headings.append((stamp, yaw))
 
     def velocity_cb(self, msg, robot):
         with self.lock:
-            if not self.accept_stamp(msg.header.stamp, robot.velocity_stamp):
+            stamp = rospy.Time.now()
+            if not self.accept_stamp(stamp, robot.velocity_stamp):
                 return
             twist = msg.twist.twist
             velocity = (twist.linear.x, twist.linear.y, twist.angular.z)
             if not all(isfinite(value) for value in velocity):
                 robot.velocity_stamp = None
                 return
-            robot.update_velocity(velocity, msg.header.stamp, self.velocity_filter_tau, self.data_timeout)
+            robot.update_velocity(velocity, stamp, self.velocity_filter_tau, self.data_timeout)
 
     def limit_cb(self, msg):
         value = float(msg.data)
@@ -620,15 +622,18 @@ def self_test():
             c.limit_cb(Float64(data=value))
             assert c.max_linear == .3
 
-        # Freshness uses source stamps: replay, future and missing inputs cannot drive.
+        # Source clock offsets do not gate input; a reception dropout still stops.
         c = new_controller()
-        step(c, 30, follower=(-1, 0, 0))
-        step(c, 31, follower=(-1, 0, 0), age=1.0)
+        for i, age in enumerate((0.0, -.08, -5.0, 5.0)):
+            cmd = step(c, 30+i*.05, follower=(-1, 0, 0), age=age)
+            assert c.state_pub.last.data == "FOLLOWING" and cmd.linear.x > 0
+        cmd = step(c, 30.2, follower=(-1, 0, 0), age=30.2)  # Zero source stamp.
+        assert cmd.linear.x > 0
+        clock.return_value = rospy.Time(31)
+        c.control_cb(None)
         assert c.state_pub.last.data == "STALE_OR_MISSING_INPUT"
         assert c.cmd_pub.last.linear.x == c.cmd_pub.last.angular.z == 0
         assert c.leader.stationary_since is None and not c.leader.stopped
-        step(c, 32, follower=(-1, 0, 0), age=-.1)
-        assert c.cmd_pub.last.linear.x == 0
         step(c, 33, follower=(-1, 0, 0))
         c.follower.velocity_stamp = None
         c.control_cb(None)
@@ -668,7 +673,7 @@ def self_test():
         assert moving.state_pub.last.data == "WAIT_ALIGNMENT"
         params["~auto_align_yaw"] = False
 
-        # Source-time prediction reproduces a constant turn, up to its horizon.
+        # Receive-time prediction reproduces a constant turn, up to its horizon.
         state = RobotState(0.0)
         state.pose, state.pose_stamp = (0, 0, 0), rospy.Time(50)
         state.velocity = (.1, 0, .2)
