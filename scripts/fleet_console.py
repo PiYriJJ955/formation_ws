@@ -622,6 +622,9 @@ class FleetConsole:
         for _, ip, terminal in list(workbench.terminals):
             if ip in addresses:
                 terminal.stop()
+        for session in workbench.iot_sessions + workbench.iot_probes:
+            if session.ip in addresses:
+                session.stop.set()
         for ip in addresses:
             session = self.sessions.pop(ip, None)
             if session:
@@ -907,6 +910,8 @@ class FleetConsole:
         for session in self.sessions.values():
             session.close()
         self.workbench.stop()
+        for session in self.workbench.iot_sessions + self.workbench.iot_probes:
+            session.stop.set()
 
     def choose_export(self):
         from tkinter import filedialog
@@ -1044,7 +1049,9 @@ class FleetConsole:
 
         def finish():
             self.poll()
-            if (self.scanning or self.workbench.active() or any(s.busy() or (s.thread and s.thread.is_alive()) for s in self.sessions.values())) and time.monotonic() < deadline:
+            if (self.scanning or self.workbench.active() or
+                    any(s.thread.is_alive() for s in self.workbench.iot_sessions + self.workbench.iot_probes) or
+                    any(s.busy() or (s.thread and s.thread.is_alive()) for s in self.sessions.values())) and time.monotonic() < deadline:
                 self.root.after(100, finish)
                 return
             for ip, session in self.sessions.items():

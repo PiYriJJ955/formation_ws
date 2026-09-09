@@ -40,6 +40,9 @@ def master_ready():
 
 def check_serial():
     ports = ('/dev/wheeltec_controller', os.environ.get('UWB_PORT', ''))
+    if ports[1] and any(os.path.exists(alias) and os.path.realpath(ports[1]) == os.path.realpath(alias)
+                        for alias in ('/dev/uwb_iot', '/dev/uwb_iot_aux')):
+        raise RuntimeError('UWB_PORT points to an IOT device; select /dev/uwb_linktrack for localization')
     if ports[1] and os.path.realpath(ports[0]) == os.path.realpath(ports[1]):
         raise RuntimeError('UWB_PORT points to the chassis serial device: ' + ports[1] +
                            '; configure a separate UWB serial port before starting')

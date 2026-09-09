@@ -226,6 +226,9 @@ class FleetWorkbench:
         self.signature = None
         self.terminals = []
         self.monitor = None
+        self.iot_window = None
+        self.iot_sessions = []
+        self.iot_probes = []
         self.active_identities = {}
         self.active_offsets = {}
         self.control_dialog = self.keyboard = None
@@ -792,37 +795,27 @@ class FleetWorkbench:
                                  (self.active_leader, x * linear, z * angular))
 
     def edit_vehicle(self):
-        selected = self.vehicles.selection()
-        if len(selected) != 1:
-            self.status.set('请选择一辆车编辑串口和偏移')
+        from fleet_iot import edit_ports
+        return edit_ports(self)
+
+    def open_iot(self):
+        from fleet_iot import IotWindow, sensors_for
+        if self.iot_window and not self.iot_window.closed:
+            self.iot_window.dialog.lift()
             return
-        ip = selected[0]
-        row = self.app.robots[ip]
-        values = row.get('formation_config', {})
-        dialog = self.tk.Toplevel(self.root)
-        dialog.title(ip + ' · 车端启动配置')
-        fields = {}
-        for index, (key, label, fallback) in enumerate([
-                ('UWB_PORT', 'UWB 串口', row.get('uwb_port', '')),
-                ('UGV_OFFSET_X', '跟随 X 偏移（米）', row.get('offset_x', '-0.8')),
-                ('UGV_OFFSET_Y', '跟随 Y 偏移（米）', row.get('offset_y', '0.8'))]):
-            self.ttk.Label(dialog, text=label).grid(row=index, column=0, padx=10, pady=8)
-            fields[key] = self.tk.StringVar(value=values.get(key, fallback))
-            self.ttk.Entry(dialog, textvariable=fields[key], width=28).grid(row=index, column=1, padx=10)
-        def save():
-            try:
-                updated = {key: value.get().strip() for key, value in fields.items()}
-                if not updated['UWB_PORT'].startswith('/dev/') or '\n' in updated['UWB_PORT']:
-                    raise ValueError('UWB 串口应使用 /dev/ 开头的设备路径')
-                if not all(math.isfinite(float(updated[key])) for key in ('UGV_OFFSET_X', 'UGV_OFFSET_Y')):
-                    raise ValueError('偏移必须是有限数值')
-                row['formation_config'] = updated
-                self.app.save()
-                self.status.set(ip + ' 配置已保存，执行“配置检查”或“快捷总启动”时应用；运行中的节点需重启。')
-                dialog.destroy()
-            except ValueError as error:
-                self.app.messagebox.showerror('配置有误', str(error), parent=dialog)
-        self.ttk.Button(dialog, text='保存，在配置检查时应用', command=save).grid(row=3, columnspan=2, pady=12)
+        if any(session.thread.is_alive() for session in self.iot_sessions):
+            self.status.set('IOT 正在停止并保存数据，请稍后重试')
+            return
+        try:
+            rows = {ip: dict(self.app.robots[ip]) for ip in self.addresses()}
+            for row in rows.values():
+                if row.get('pending_id'):
+                    raise ValueError('请先应用车辆编号，再启动 IOT')
+                sensors_for(row)
+            self.iot_window = IotWindow(self, rows)
+            self.iot_sessions = self.iot_window.sessions
+        except ValueError as error:
+            self.app.messagebox.showerror('IOT 监视', str(error))
 
     def limit_ready(self, number):
         monitor = self.monitor
@@ -1007,6 +1000,7 @@ class FleetWorkbench:
         toolbar = self.ttk.Frame(page)
         toolbar.pack(fill='x')
         self.ttk.Button(toolbar, text='连接实时监视', command=lambda: self.start('monitor')).pack(side='left')
+        self.ttk.Button(toolbar, text='启动 IOT 实时监视', command=self.open_iot).pack(side='left', padx=6)
         self.ttk.Button(toolbar, text='编辑基站坐标 / 高度', command=self.edit_anchors).pack(side='left', padx=8)
         self.ttk.Button(toolbar, text='清空轨迹', command=self.clear_trails).pack(side='left')
         self.ttk.Button(toolbar, text='立即停车 / 禁用跟随', command=self.emergency).pack(side='right')
@@ -1315,6 +1309,10 @@ class FleetWorkbench:
             self.last_paint = now
 
     def close(self):
+        if self.iot_window and not self.iot_window.closed:
+            self.iot_window.close()
+        for session in self.iot_sessions + self.iot_probes:
+            session.stop.set()
         self.stop()
         for pending in self.key_releases.values():
             self.root.after_cancel(pending)

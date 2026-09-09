@@ -58,3 +58,13 @@ with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml') as custom:
     assert config.params['/ugv7/uwb_localizer/anchors'].value == anchors
     assert config.params['/ugv7/uwb_localizer/tag_height'].value == 0.33
 print('Custom anchor config reaches the real localizer launch.')
+
+for robot, aux, expected in [('ugv2', '', 1), ('ugv3', '/dev/uwb_iot_aux', 2)]:
+    config = resolve('nlink_parser', 'iot_monitor.launch',
+                     ['robot_name:=' + robot, 'port_name:=/dev/uwb_iot', 'aux_port:=' + aux])
+    assert len(config.nodes) == expected
+    assert all(node.package == 'nlink_parser' and node.type == 'iot' for node in config.nodes)
+    assert config.params['/' + robot + '/uwb_iot/iot/port_name'].value == '/dev/uwb_iot'
+    if aux:
+        assert config.params['/ugv3/uwb_iot_aux/iot/port_name'].value == aux
+print('IOT launch checks passed for one sensor and ugv3 left/right sensors.')

@@ -1,0 +1,19 @@
+<launch>
+  <arg name="robot_name" />
+  <arg name="port_name" default="/dev/uwb_iot" />
+  <arg name="aux_port" default="" />
+  <group ns="$(arg robot_name)">
+    <group ns="uwb_iot">
+      <node pkg="nlink_parser" type="iot" name="iot" output="screen" required="true">
+        <param name="port_name" value="$(arg port_name)" />
+        <param name="baud_rate" type="int" value="921600" />
+      </node>
+    </group>
+    <group ns="uwb_iot_aux" if="$(eval arg('aux_port') != '')">
+      <node pkg="nlink_parser" type="iot" name="iot" output="screen" required="true">
+        <param name="port_name" value="$(arg aux_port)" />
+        <param name="baud_rate" type="int" value="921600" />
+      </node>
+    </group>
+  </group>
+</launch>

@@ -32,11 +32,55 @@ UID 来自 IOT 协议帧，USB 序列号来自 `udevadm`，两者用途不同。
 | ugv3 | `5B7A090917` |
 | ugv4 | `5B7A129523` |
 
-**编队启动前需要修正定位串口设置。** 本次发现三车 `robot.env` 中的 `UWB_PORT`，以及
-正在运行的主机控制台保存的 `formation_config.UWB_PORT`，均为 `/dev/ttyCH343USB1`，
-该路径当前对应 IOT。请在控制台逐车“编辑选中车 UWB 串口 / 编队偏移”，将 UWB 串口设为
-`/dev/uwb_linktrack` 并保存；控制台下次启动会写入车端配置。
-本次仅安装设备路径规则，保留这些现有启动配置；仅修改车端会被控制台保存的设置覆盖。
+编队定位的 `UWB_PORT` 应指向 `/dev/uwb_linktrack`。枚举路径可能在重插后改变，
+请通过下面的设备识别功能核对；仅修改车端配置可能被控制台保存的设置覆盖。
+
+## 控制台端口识别与实时图表
+
+第二页选择一辆车，点击“编辑选中车 UWB 串口 / 编队偏移”，再点击“识别 UWB 设备”。
+弹窗分别配置 `uwb_linktrack`、`uwb_iot`；ugv3 还会显示左板 `uwb_iot_aux`，并标注左右板 UID。
+空闲串口按 921600 波特率读取并校验 NLink 协议帧，IOT 根据 UID 匹配左右板。
+识别后优先填写固定路径，也可手动选择或输入端口。底盘、雷达别名对应的串口不参与探测；
+已占用的串口会标注占用状态，设备类型如来自固定路径会明确显示“路径识别”。
+
+“保存配置”会将 LinkTrack 和偏移保存在 `formation_config`，执行配置检查时写入车端；
+IOT 端口单独保存在 `iot_ports`，下次启动 IOT 监视时使用。端口配置不会热切换运行中的节点。
+
+第三页顶部点击“启动 IOT 实时监视”，按第二页选中的车辆启动采集并打开大窗口。
+仅测试 ugv3 时，第二页只选 `192.168.0.109`。ugv3 同时启动两个 IOT，其他车辆启动一个。
+窗口显示来源设备 UID、帧数、有向链路当前距离和水平角，以及最近 60 秒的图表。
+默认列出六条编队链路，收到其他链路时自动追加；未知对端显示十六进制 UID。
+选择表格行可筛选曲线，Ctrl / Shift 可多选，“显示全部链路”恢复全部曲线。
+对端缺测时留空，1 秒未更新显示过期；超出 NIU_B01 有效测角范围 ±50° 的点标红。
+所有输出均保留，图表不增加平滑。横轴是主机接收时间，不代表设备时钟已同步。
+
+点击“停止采集”会结束本次 IOT launch、保存 bag，并保留图表供查看。
+关闭弹窗、断开全部或退出软件同样会停止采集；关闭弹窗后可再次点击入口开始新一轮。
+连接失败、UID 不匹配或串口被占用时按车辆显示错误，其余车辆可继续采集。
+
+IOT 使用每车回环 Master（11341），可独立于编队 Master 运行。
+启动前核对车端 `UGV_ID`、实际 IOT 协议与来源 UID，禁止与底盘、LinkTrack 或另一块 IOT 共用串口。
+临时上传 [fleet_iot_remote.py](../scripts/fleet_iot_remote.py) 和
+[iot_monitor.launch](../src/nlink_parser/launch/iot_monitor.launch)，复用车端已编译的 `nlink_parser/iot`。
+
+- 主机：`logs/uwb_iot/live_时间_编号/ugvN-IP.jsonl`，逐帧记录来源/对端 UID、
+  设备时间、接收时间、距离、水平角和 RSSI，包含空对端帧。
+- 车端：工作空间下同名 `logs/uwb_iot/live_时间_编号/`，包含完整原始 `iot.bag`、
+  `iot.log`、`master.log` 和 ROS 日志。窗口状态显示车端保存位置。
+
+2026-09-09 已在 ugv3 验证实际识别、双 IOT launch、图表与正常停止。
+验证 bag 为 `logs/uwb_iot/live_20260909_135751_6ee711/ugv3/iot.bag`，
+右板记录 173 帧、左板记录 172 帧；结束后两个 IOT 串口已释放。
+此轮从 ugv3 接收对端广播，未测试其他车的控制台启动流程。
+停止收尾复测为 `logs/uwb_iot/live_20260909_140358_shutdown_check/`，
+右板 51 帧、左板 50 帧；主机 JSONL 与原始 bag 帧数一致，并收到保存完成确认。
+端口、图表回归检查通过主机 Python 3.8 和兼容环境 Python 3.6，车端实际运行 Python 2。
+
+```bash
+python3 test/test_fleet_iot.py
+source scripts/env.sh
+python3 test/test_fleet_launch.py
+```
 
 ## 采集结果
 
