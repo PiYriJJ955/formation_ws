@@ -169,10 +169,12 @@ def main():
                 limits.update({'0': 0.15, '1': 0.15})
                 pump(1.2)
                 assert abs(latest['tracking']['yaw']) < 1e-6, latest
-                request('start', points=[[1, 2], [2, 2], [2, 3]], speed=0.1, lookahead=0.4)
+                request('start', points=[[1, 2], [2, 2], [2, 3]], bends=[0.1, 0], speed=0.1, lookahead=0.4)
                 started = time.monotonic()
                 pump(1.2, linear=0.5)
                 assert latest['tracking']['state'] == 'TRACKING', latest
+                assert latest['tracking']['waypoints'] == [[1, 2], [2, 2], [2, 3]], latest
+                assert [1.5, 2.1] in latest['tracking']['points'], latest
                 auto = [(t, v) for t, v in velocities[0] if t > started+0.2]
                 assert len(auto) >= 15 and all(0 <= v <= 0.1 for _, v in auto), auto
                 assert any(v > 0.05 for _, v in auto), auto
@@ -212,6 +214,8 @@ def main():
                 assert latest['tracking']['state'] == 'STOPPED', latest
                 with open(Path(latest['tracking']['log_directory'])/'tracking.csv') as stream:
                     records = list(csv.DictReader(stream))
+                with open(Path(latest['tracking']['log_directory'])/'path.json') as stream:
+                    assert json.load(stream)['bends'] == [0.1, 0]
                 assert {'TRACKING', 'PAUSED', 'STOPPED'} <= {r['state'] for r in records}, records[-4:]
                 assert 'max_linear' in records[0] and 'heading_error' in records[0], records[0]
                 request('resume')

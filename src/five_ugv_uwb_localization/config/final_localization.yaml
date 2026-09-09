@@ -36,7 +36,7 @@ link_recovery_step: 0.05
 initialization_frames: 8
 initialization_spread: 0.15
 valid_recovery_frames: 3
-valid_max_residual_rms: 0.35
+valid_max_residual_rms: 0.6
 max_geometry_condition: 20.0
 max_position_correction: 0.06
 

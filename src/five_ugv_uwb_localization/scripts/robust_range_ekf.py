@@ -29,7 +29,7 @@ class RangeEKF(object):
         self.recovery_step = float(config.get('link_recovery_step', 0.05))
         self.init_frames = int(config.get('initialization_frames', 8))
         self.init_spread = float(config.get('initialization_spread', 0.15))
-        self.max_rms = float(config.get('valid_max_residual_rms', 0.35))
+        self.max_rms = float(config.get('valid_max_residual_rms', 0.6))
         self.max_condition = float(config.get('max_geometry_condition', 20.0))
         self.max_correction = float(config.get('max_position_correction', 0.06))
         self.max_stddev = float(config.get('max_position_stddev', 0.35))

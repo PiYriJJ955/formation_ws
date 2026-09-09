@@ -15,6 +15,7 @@ import queue
 import re
 import shlex
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -46,6 +47,40 @@ DEFAULTS.update(WORKBENCH_DEFAULTS)
 CSV_FIELDS = ['ip', 'name', 'robot_id', 'remark', 'ssh', 'repository', 'ros_master',
               'chassis', 'car_mode', 'voltage', 'last_seen', 'error']
 HOST_KEY_LOCK = threading.Lock()
+
+
+def watch_git_server(events, stopped):
+    command = ['systemctl', '--user']
+    service = 'formation-git-http.service'
+    startup_error = ''
+    try:
+        result = subprocess.run(command + ['start', service], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, universal_newlines=True, timeout=15)
+        if result.returncode:
+            startup_error = result.stderr.strip() or '服务启动失败'
+    except (OSError, subprocess.TimeoutExpired) as error:
+        startup_error = str(error)
+    while not stopped.is_set():
+        running = False
+        try:
+            result = subprocess.run(command + ['is-active', service], stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, universal_newlines=True, timeout=3)
+            state = result.stdout.strip()
+            running = result.returncode == 0 and state == 'active'
+            if running:
+                startup_error = ''
+                status = '运行中 · HTTP 端口 8000'
+            else:
+                status = {'inactive': '未运行', 'failed': '运行失败', 'activating': '正在启动…',
+                          'deactivating': '正在停止…', 'reloading': '正在重载…'}.get(state, '不可用')
+                detail = startup_error or result.stderr.strip()
+                if detail:
+                    status += '：' + detail
+        except (OSError, subprocess.TimeoutExpired) as error:
+            status = '状态检查失败：' + str(error)
+        events.put(('git_server', None, {'text': 'Git server：' + ' '.join(status.split())[:180],
+                                         'running': running}))
+        stopped.wait(3)
 
 
 @contextmanager
@@ -435,6 +470,10 @@ class FleetConsole:
         style.theme_use('clam')
         style.configure('Treeview', rowheight=30)
         style.configure('TButton', padding=6)
+        self.git_status = tk.StringVar(value='Git server：正在启动…')
+        self.git_status_label = ttk.Label(root, textvariable=self.git_status, padding=(8, 4),
+                                          foreground='#ad6f00', wraplength=1080)
+        self.git_status_label.pack(side='bottom', fill='x')
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill='both', expand=True)
         outer = ttk.Frame(self.notebook, padding=8)
@@ -1020,6 +1059,9 @@ class FleetConsole:
                         self.vars['loop'].set(False)
             elif event == 'message':
                 self.status.set(data['text'])
+            elif event == 'git_server':
+                self.git_status.set(data['text'])
+                self.git_status_label.configure(foreground='#267346' if data['running'] else '#b52b33')
         if self.motion:
             session, velocity = self.motion
             if session.ready and session.alive() and session is self.sessions.get(self.selected_ip):
@@ -1081,13 +1123,19 @@ def main():
         root.destroy()
         return
     try:
-        FleetConsole(root, args.config)
+        app = FleetConsole(root, args.config)
     except (OSError, ValueError, KeyError, TypeError) as error:
         from tkinter import messagebox
         messagebox.showerror('配置读取失败', '%s\n配置：%s' % (error, args.config))
         root.destroy()
         return
-    root.mainloop()
+    stopped = threading.Event()
+    watcher = threading.Thread(target=watch_git_server, args=(app.events, stopped), daemon=True)
+    watcher.start()
+    try:
+        root.mainloop()
+    finally:
+        stopped.set()
 
 
 if __name__ == '__main__':

@@ -190,14 +190,19 @@ class WorkbenchChecks(unittest.TestCase):
         base = localization_config()
         self.assertEqual(len(base['anchors']), 6)
         self.assertEqual(base['anchors'][2]['x'], 6.4)
-        changed = json.loads(json.dumps(dict(anchors=base['anchors'], tag_height=0.32)))
+        self.assertEqual(base['valid_max_residual_rms'], 0.6)
+        changed = json.loads(json.dumps(dict(anchors=base['anchors'], tag_height=0.32,
+                                             valid_max_residual_rms=0.55)))
         changed['anchors'][2].update(x=7.4, z=1.6)
         result = localization_config(json.dumps(changed))
         self.assertEqual(result['workspace_x_max'], 7.4)
         self.assertEqual(result['innovation_huber_sigma'], base['innovation_huber_sigma'])
         self.assertEqual(result['tag_height'], 0.32)
+        self.assertEqual(result['valid_max_residual_rms'], 0.55)
         cases = [dict(changed, anchors=changed['anchors'][:3]),
                  dict(changed, tag_height=float('nan')),
+                 dict(changed, valid_max_residual_rms=0),
+                 dict(changed, valid_max_residual_rms=float('nan')),
                  dict(changed, anchors=[dict(a, id=0) for a in changed['anchors']]),
                  dict(changed, anchors=[dict(a, y=0) for a in changed['anchors']])]
         for value in cases:
@@ -729,6 +734,111 @@ class WorkbenchChecks(unittest.TestCase):
                 app.vars['leader'].set('ugv2')
                 wb.poll()
                 self.assertEqual(wb.monitor.control_request['action'], 'stop')
+            finally:
+                app.closing = True
+                for timer in root.tk.splitlist(root.tk.call('after', 'info')):
+                    root.after_cancel(timer)
+                root.destroy()
+
+    def test_map_curve_drag_restore_save_and_control_request(self):
+        import tkinter as tk
+        from leader_tracker import LeaderTracker, sample_path
+        try:
+            root = tk.Tk()
+        except tk.TclError:
+            self.skipTest('No desktop session')
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('fleet_console.connect_ssh', side_effect=AssertionError('Offline test')):
+            app = FleetConsole(root, Path(directory) / 'settings.json')
+            wb = app.workbench
+            try:
+                app.vars['leader_control_mode'].set('path')
+                app.vars['leader_path'].set('1, 2\n3, 2\n4, 2')
+                wb.open_leader_control()
+                wb.begin_path_pick()
+                root.update()
+                points = list(wb.path_preview)
+
+                def mouse(kind, x, y):
+                    ox, oy, scale = wb.map_transform
+                    wb.canvas.event_generate(kind, x=round(ox+x*scale), y=round(oy-y*scale))
+
+                def drag(start, end):
+                    mouse('<Button-1>', *start)
+                    self.assertIsNotNone(wb.path_drag)
+                    mouse('<B1-Motion>', *end)
+                    mouse('<ButtonRelease-1>', *end)
+
+                self.assertEqual(len(wb.canvas.find_withtag('curve_handle')), 2)
+                drag((2, 2), (2, 3))
+                self.assertAlmostEqual(wb.path_bends[0], 1, delta=0.03)
+                self.assertEqual(wb.path_bends[1], 0)
+                self.assertEqual(wb.path_preview, points)
+                self.assertEqual(len(wb.canvas.find_withtag('path_point')), 3)
+                line = wb.canvas.find_withtag('reference_path')[0]
+                self.assertGreater(len(wb.canvas.coords(line)), 4)
+                saved = list(wb.path_bends)
+                drag((2, 2+saved[0]), (2, 5))
+                self.assertIn('未保存', wb.path_pick_status.get())
+                self.assertEqual(wb.path_bends, saved)
+
+                root.geometry('1050x700')
+                root.update()
+                # Grab the curved line away from the midpoint after resizing.
+                drag((1.5, 2+0.75*saved[0]), (1.5, 2+0.75*saved[0]-0.5))
+                self.assertAlmostEqual(wb.path_bends[0], 0.5, delta=0.04)
+                mouse('<Button-3>', 2, 2+wb.path_bends[0])
+                self.assertEqual(wb.path_bends, [0, 0])
+                self.assertEqual(len(wb.canvas.coords(wb.canvas.find_withtag('reference_path')[0])), 4)
+                drag((3.5, 2), (3.5, 1.5))
+                self.assertAlmostEqual(wb.path_bends[1], -0.5, delta=0.03)
+                wb.open_leader_control()
+                root.update()
+                saved = list(wb.path_bends)
+                wb.active_leader = app.vars['leader'].get()
+                wb.monitor = SimpleNamespace(ready=True, last=time.monotonic(), subscribers=1, enable=False,
+                                             drive=(0, 0, 0), tracking={'state': 'STOPPED'},
+                                             control_request={'sequence': 0, 'action': 'path'})
+                with patch.object(app.messagebox, 'showerror') as error:
+                    wb.trajectory_action('start')
+                    self.assertIn('重新连接', error.call_args[0][1])
+                self.assertEqual(wb.monitor.control_request['action'], 'path')
+                wb.monitor.tracking['curves_supported'] = True
+                wb.trajectory_action('start')
+                request = wb.monitor.control_request
+                self.assertEqual(request['action'], 'start')
+                self.assertEqual(request['points'], points)
+                self.assertEqual(request['bends'], saved)
+                tracker = LeaderTracker()
+                tracker.start(request['points'], request['speed'], request['lookahead'], (1, 2, 0), 0,
+                              bends=request['bends'])
+                self.assertEqual(tracker.points, sample_path(points, saved))
+                self.assertEqual(tracker.status()['waypoints'], points)
+                wb.monitor = None
+
+                app.save()
+                options, _ = load_settings(app.config_path)
+                self.assertEqual(json.loads(options['leader_path_bends']), saved)
+                wb.close_control_dialog()
+                wb.open_leader_control()
+                self.assertEqual(wb.path_bends, saved)
+                wb.edit_path('append', (5, 2))
+                self.assertEqual(wb.path_bends, saved+[0])
+                wb.edit_path('undo')
+                self.assertEqual(wb.path_bends, saved)
+                root.update()
+                wb.path_editor.insert('end', '\n5, 2')
+                root.update()
+                self.assertEqual(json.loads(app.vars['leader_path_bends'].get()), [])
+                self.assertEqual(wb.read_path()[1], [0, 0, 0])
+                wb.edit_path('clear')
+                self.assertEqual(wb.path_bends, [])
+                wb.edit_path('append', (2, 2))
+                wb.edit_path('append', (2.2, 2))
+                wb.begin_path_pick()
+                root.update()
+                drag((2.1, 2), (2.1, 2.2))  # Handle overlaps endpoints at this zoom.
+                self.assertAlmostEqual(wb.path_bends[0], 0.2, delta=0.03)
             finally:
                 app.closing = True
                 for timer in root.tk.splitlist(root.tk.call('after', 'info')):

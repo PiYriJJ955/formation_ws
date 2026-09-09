@@ -7,17 +7,20 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'scripts'))
-from leader_tracker import LeaderTracker, check_bounds, parse_points
+from leader_tracker import LeaderTracker, check_bounds, parse_points, sample_path
 
 
 class TrackingChecks(unittest.TestCase):
     def test_straight_turn_and_initial_alignment(self):
-        for points, heading in [([(0, 0), (2, 0)], 0), ([(0, 0), (1, 0), (1, 1)], 0),
-                                ([(0, 0), (1, 0)], math.pi),
-                                ([(0, 0), (1, 0), (0.1, 0.1)], 0)]:
+        for points, heading, bends in [([(0, 0), (2, 0)], 0, None), ([(0, 0), (1, 0), (1, 1)], 0, None),
+                                       ([(0, 0), (1, 0)], math.pi, None),
+                                       ([(0, 0), (1, 0), (0.1, 0.1)], 0, None),
+                                       ([(0, 0), (2, 0)], 0, [0.6]),
+                                       ([(0, 0), (2, 0)], 0, [-0.6]),
+                                       ([(0, 0), (1, 0), (2, 0)], 0, [0.25, -0.25])]:
             tracker = LeaderTracker()
             pose, now = [0.0, 0.0, heading], 0.0
-            tracker.start(points, 0.1, 0.4, pose, now)
+            tracker.start(points, 0.1, 0.4, pose, now, bends=bends)
             errors = []
             for _ in range(1800):
                 now += 0.05
@@ -39,6 +42,28 @@ class TrackingChecks(unittest.TestCase):
             self.assertEqual(tracker.state, 'DONE', (points, pose, tracker.status()))
             self.assertLessEqual(math.hypot(pose[0]-points[-1][0], pose[1]-points[-1][1]), 0.101)
             self.assertLess(max(errors), 0.25)
+
+    def test_curves_preserve_waypoints_and_validate_interior(self):
+        points = [(1, 2), (3, 2), (4, 2)]
+        self.assertEqual(sample_path(points), points)
+        path = sample_path(points, [0.6, 0])
+        self.assertGreater(len(path), 50)
+        self.assertEqual((path[0], path[-2], path[-1]), tuple(points))
+        self.assertIn((2, 2.6), path)
+        for a, b in zip(path[:-1], path[1:-1]):
+            self.assertGreater(math.hypot(b[0]-a[0], b[1]-a[1]), 0)
+            self.assertLessEqual(math.hypot(b[0]-a[0], b[1]-a[1]), 0.05)
+        self.assertIn((-0.6, 1), sample_path([(0, 0), (0, 2)], [0.6]))
+        for bends in ([True, 0], ['1', 0], [float('nan'), 0], [float('inf'), 0], [1], {'0': 1}, False):
+            with self.assertRaises(ValueError):
+                sample_path(points, bends)
+        with self.assertRaises(ValueError):
+            sample_path(points, [1000, 1000])
+        check_bounds(points, (0, 0, 6.4, 4.4))
+        with self.assertRaises(ValueError):
+            check_bounds(sample_path(points, [3, 0]), (0, 0, 6.4, 4.4))
+        with self.assertRaises(ValueError):
+            check_bounds(sample_path([(2, 2), (4, 2)], [1.2]), (0, 0, 6.4, 4.4), [(0.8, 0.8)])
 
     def test_limits_rotation_budget_and_explicit_resume(self):
         tracker = LeaderTracker()

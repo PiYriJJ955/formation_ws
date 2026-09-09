@@ -8,7 +8,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import queue
 import threading
 import socket
@@ -18,12 +18,51 @@ import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from fleet_console import (DEFAULTS, FleetConsole, expand_addresses, export_csv,
-                           load_settings, save_settings, targets_from, validate, RobotSession, connect_ssh)
+                           load_settings, save_settings, targets_from, validate, RobotSession, connect_ssh,
+                           watch_git_server)
 from fleet_bridge import velocity, COMMAND_TIMEOUT, check_master_port
 from fleet_deploy import replace_master, update_master, read_robot_config, grant_serial_permissions
 
 
 class ConsoleChecks(unittest.TestCase):
+    def test_git_server_starts_once_and_tracks_service_changes(self):
+        events, stopped = queue.Queue(), Mock()
+        stopped.is_set.side_effect = [False, False, False, False, True]
+        states = [(0, ''), (0, 'active'), (3, 'inactive'), (3, 'failed'), (0, 'active')]
+        with patch('fleet_console.subprocess.run', side_effect=[
+                subprocess.CompletedProcess([], code, state + '\n', '') for code, state in states]) as run:
+            watch_git_server(events, stopped)
+        self.assertEqual([call[0][0] for call in run.call_args_list],
+                         [['systemctl', '--user', 'start', 'formation-git-http.service']] +
+                         [['systemctl', '--user', 'is-active', 'formation-git-http.service']] * 4)
+        for expected, running in [('运行中', True), ('未运行', False), ('运行失败', False), ('运行中', True)]:
+            event, _, data = events.get_nowait()
+            self.assertEqual(event, 'git_server')
+            self.assertIn(expected, data['text'])
+            self.assertEqual(data['running'], running)
+        self.assertEqual(stopped.wait.call_count, 4)
+
+    def test_git_server_reports_start_and_status_errors_then_recovers(self):
+        for failure in (subprocess.CompletedProcess([], 1, '', 'Unit not found'),
+                        FileNotFoundError('systemctl not found'),
+                        subprocess.TimeoutExpired('systemctl', 15)):
+            with self.subTest(failure=failure):
+                events, stopped = queue.Queue(), Mock()
+                stopped.is_set.side_effect = [False, False, False, False, True]
+                with patch('fleet_console.subprocess.run', side_effect=[failure,
+                        subprocess.CompletedProcess([], 3, 'inactive\n', ''),
+                        subprocess.TimeoutExpired('systemctl', 3),
+                        subprocess.CompletedProcess([], 0, 'active\n', ''),
+                        subprocess.CompletedProcess([], 3, 'inactive\n', '')]):
+                    watch_git_server(events, stopped)
+                data = events.get_nowait()[2]
+                self.assertFalse(data['running'])
+                self.assertIn('Unit not found' if isinstance(failure, subprocess.CompletedProcess) else str(failure),
+                              data['text'])
+                self.assertIn('状态检查失败', events.get_nowait()[2]['text'])
+                self.assertTrue(events.get_nowait()[2]['running'])
+                self.assertEqual(events.get_nowait()[2]['text'], 'Git server：未运行')
+
     def test_serial_permissions_stdin_sudo_and_device_failures(self):
         # Run the real shell command against temporary files and a fake sudo.
         with tempfile.TemporaryDirectory() as directory:
@@ -226,6 +265,12 @@ class ConsoleChecks(unittest.TestCase):
         root.withdraw()
         with tempfile.TemporaryDirectory() as directory:
             app = FleetConsole(root, Path(directory) / 'settings.json')
+            for running in (True, False):
+                app.events.put(('git_server', None, {'text': 'Git server：测试状态', 'running': running}))
+                app.poll()
+                self.assertEqual(app.git_status.get(), 'Git server：测试状态')
+                self.assertEqual(str(app.git_status_label.cget('foreground')), '#267346' if running else '#b52b33')
+            self.assertIs(app.git_status_label.master, root)
             commands = {}
             actions = []
 

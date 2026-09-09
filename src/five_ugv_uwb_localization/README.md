@@ -49,6 +49,7 @@ rostopic echo /ugv1/uwb/valid
 |---|---:|---|
 | `solve_rate` | 20.0 | 最新帧目标求解频率，Hz；过载时实际输出可以更低 |
 | `max_measurement_age` | 0.15 | 从本节点接收起允许的最大结果年龄，秒 |
+| `valid_max_residual_rms` | 0.6 | 定位结果允许的最大测距残差 RMS，米 |
 | `position_lpf_reference_rate` | 50.0 | `position_lpf_alpha` 对应的参考频率，Hz |
 | `path_publish_rate` | 2.0 | 轨迹最大发布频率，Hz；0 关闭轨迹收集和发布 |
 | `path_max_points` | 1000 | 轨迹保留点数上限；完整历史使用离线日志 |

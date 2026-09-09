@@ -328,27 +328,38 @@ class IotWindow:
         toolbar = ttk.Frame(self.dialog, padding=8)
         toolbar.pack(fill='x')
         ttk.Button(toolbar, text='停止采集', command=self.stop).pack(side='left')
-        ttk.Button(toolbar, text='显示全部链路', command=lambda: self.table.selection_remove(self.table.selection())).pack(side='left', padx=5)
         ttk.Label(toolbar, text='距离 m / 水平角 ° · 来源板局部坐标 · 最近 60 秒 · 红点表示超出 ±50°').pack(side='left', padx=12)
         self.status = tk.StringVar(value='正在启动所选车辆的 IOT…')
         ttk.Label(self.dialog, textvariable=self.status, wraplength=1230).pack(fill='x', padx=10)
-        self.device_status = tk.StringVar()
-        ttk.Label(self.dialog, textvariable=self.device_status, wraplength=1230).pack(fill='x', padx=10, pady=5)
-        table_frame = ttk.Frame(self.dialog)
-        table_frame.pack(fill='x', padx=10)
-        self.table = ttk.Treeview(table_frame, columns=('link', 'distance', 'angle', 'count', 'state'),
-                                 show='headings', height=7, selectmode='extended')
-        for key, label, width in [('link', '有向链路（可多选曲线）', 340), ('distance', '距离 m', 150),
-                                  ('angle', '水平角 °', 150), ('count', '记录数', 100), ('state', '数据状态', 210)]:
-            self.table.heading(key, text=label)
-            self.table.column(key, width=width)
-        scroll = ttk.Scrollbar(table_frame, command=self.table.yview)
-        self.table.configure(yscrollcommand=scroll.set)
+        panes = ttk.Panedwindow(self.dialog, orient='horizontal')
+        panes.pack(fill='both', expand=True, padx=10, pady=8)
+        sidebar, chart = ttk.Frame(panes, padding=(0, 0, 8, 0)), ttk.Frame(panes)
+        panes.add(sidebar, weight=0)
+        panes.add(chart, weight=1)
+        heading = ttk.Frame(sidebar)
+        heading.pack(fill='x', pady=(0, 6))
+        ttk.Label(heading, text='有向链路').pack(side='left')
+        ttk.Button(heading, text='清空', width=5,
+                   command=lambda: self.link_menu.selection_remove(self.link_menu.selection())).pack(side='right')
+        ttk.Button(heading, text='全选', width=5,
+                   command=lambda: self.link_menu.selection_set(self.link_menu.get_children())).pack(side='right', padx=4)
+        ttk.Label(sidebar, text='单击单选 · Ctrl / Shift 多选').pack(anchor='w', pady=(0, 8))
+        menu_frame = ttk.Frame(sidebar)
+        menu_frame.pack(fill='both', expand=True)
+        self.link_menu = ttk.Treeview(menu_frame, show='tree', selectmode='extended')
+        self.link_menu.column('#0', width=285, minwidth=220, stretch=True)
+        scroll = ttk.Scrollbar(menu_frame, command=self.link_menu.yview)
+        self.link_menu.configure(yscrollcommand=scroll.set)
         scroll.pack(side='right', fill='y')
-        self.table.pack(fill='x')
-        ttk.Label(self.dialog, text='未选择行时显示全部链路；缺测留空，未收到其他车数据时保持等待。').pack(anchor='w', padx=10)
-        self.canvas = tk.Canvas(self.dialog, background='#f7fafc', highlightthickness=0)
-        self.canvas.pack(fill='both', expand=True, padx=10, pady=6)
+        self.link_menu.pack(fill='both', expand=True)
+        self.swatches = []
+        for color in COLORS:
+            swatch = tk.PhotoImage(master=self.dialog, width=10, height=10)
+            swatch.put(color, to=(1, 1, 9, 9))
+            self.swatches.append(swatch)
+        self.canvas = tk.Canvas(chart, background='#f7fafc', highlightthickness=0)
+        self.canvas.pack(fill='both', expand=True)
+        self.link_menu.bind('<<TreeviewSelect>>', lambda _: self.paint(self.stopped_at or time.monotonic()))
         ttk.Label(self.dialog, text='本机帧记录：' + str(self.directory), wraplength=1230).pack(anchor='w', padx=10, pady=5)
         self.dialog.protocol('WM_DELETE_WINDOW', self.close)
         options = self.app.current_options()
@@ -385,7 +396,7 @@ class IotWindow:
                 uid = data['uid']
                 self.sensor_counts[uid] = self.sensor_counts.get(uid, 0) + 1
             elif event == 'started':
-                self.states[ip] = '采集中 · bag: ' + data['directory']
+                self.states[ip] = '采集中'
                 self.devices[ip] = data['sensors']
                 robot = next(s.row['robot_id'] for s in self.sessions if s.ip == ip)
                 for sensor in data['sensors']:
@@ -393,36 +404,20 @@ class IotWindow:
             elif event == 'error':
                 self.states[ip] = '失败：' + data['message']
             elif event == 'stopped':
-                self.states[ip] = '已保存 bag · ' + data['directory']
+                self.states[ip] = '已保存'
             elif event == 'closed' and not self.states[ip].startswith(('失败', '已保存')):
                 self.states[ip] = '已停止'
         self.status.set('  |  '.join(ip + ' ' + state for ip, state in self.states.items()))
-        devices = []
-        for session in self.sessions:
-            for sensor in self.devices.get(session.ip, sensors_for(session.row)):
-                uid = sensor['uid']
-                count = self.sensor_counts.get(uid, 0)
-                stamp = self.history.sources.get(uid, (-1e9, 0))[0]
-                devices.append('%s · 0x%08X · %d 帧 · %s' % (self.names.get(uid, session.row['robot_id']), uid, count,
-                               '在线' if now - stamp < 1 else '等待数据 / 已停止'))
-        self.device_status.set('    '.join(devices))
-        for index, (key, points) in enumerate(self.history.links.items()):
+        first_menu = not self.link_menu.get_children()
+        for index, key in enumerate(self.history.links):
             iid = '%d:%d' % key
-            color = COLORS[index % len(COLORS)]
-            self.table.tag_configure(iid, foreground=color)
-            latest = self.history.latest.get(key)
-            current = latest and now - latest[0] < 1 and points and points[-1][1] is not None
-            label = '等待数据' if latest is None else '缺测 / 已过期'
-            if current:
-                label = '超出 ±50°' if latest[2] is not None and abs(latest[2]) > 50 else '实时'
-            values = (self.names.get(key[0], uid_name(key[0])) + ' → ' + self.names.get(key[1], uid_name(key[1])),
-                      '%.3f' % latest[1] if current and latest[1] is not None else '—',
-                      '%.2f' % latest[2] if current and latest[2] is not None else '—',
-                      self.history.counts.get(key, 0), label)
-            if self.table.exists(iid):
-                self.table.item(iid, values=values)
+            label = self.names.get(key[0], uid_name(key[0])) + ' → ' + self.names.get(key[1], uid_name(key[1]))
+            if self.link_menu.exists(iid):
+                self.link_menu.item(iid, text=label)
             else:
-                self.table.insert('', 'end', iid=iid, values=values, tags=(iid,))
+                self.link_menu.insert('', 'end', iid=iid, text=label, image=self.swatches[index % len(COLORS)])
+        if first_menu:
+            self.link_menu.selection_set(['%d:%d' % key for key in LINKS])
         if self.stopped_at is None and not any(s.thread.is_alive() for s in self.sessions):
             self.stopped_at = now
         self.paint(self.stopped_at or now)
@@ -431,10 +426,13 @@ class IotWindow:
     def paint(self, now):
         canvas = self.canvas
         canvas.delete('all')
-        width, height = max(canvas.winfo_width(), 600), max(canvas.winfo_height(), 200)
-        selected = set(self.table.selection())
+        width, height = max(canvas.winfo_width(), 300), max(canvas.winfo_height(), 200)
+        selected = set(self.link_menu.selection())
+        if not selected:
+            canvas.create_text(width / 2, height / 2, text='请选择左侧有向链路', fill='#526574')
+            return
         curves = [(key, points, COLORS[i % len(COLORS)]) for i, (key, points) in enumerate(self.history.links.items())
-                  if not selected or '%d:%d' % key in selected]
+                  if '%d:%d' % key in selected]
         for component, title in [(1, '距离（m）'), (2, '水平角（°）')]:
             left, right = 65, width - 20
             top, bottom = (component - 1) * height / 2 + 28, component * height / 2 - 28

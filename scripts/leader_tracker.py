@@ -59,11 +59,38 @@ def check_bounds(points, bounds, offsets=()):
         raise ValueError('PATH_OUTSIDE')
 
 
+def curve_point(a, b, bend, t):
+    """Quadratic arc whose midpoint is bend metres left of the chord."""
+    dx, dy = b[0]-a[0], b[1]-a[1]
+    offset = 4*bend*t*(1-t)/math.hypot(dx, dy)
+    return a[0]+t*dx-offset*dy, a[1]+t*dy+offset*dx
+
+
+def sample_path(points, bends=None, min_points=2):
+    points = validate_points(points, min_points=min_points)
+    if bends is None or bends == []:
+        bends = [0.0] * max(0, len(points)-1)
+    if (not isinstance(bends, (list, tuple)) or len(bends) != max(0, len(points)-1) or
+            any(isinstance(v, bool) or not isinstance(v, (int, float)) or
+                not finite(v) or abs(v) > 1000 for v in bends)):
+        raise ValueError('PATH_CURVES')
+    sampled = points[:1]
+    for a, b, bend in zip(points, points[1:], bends):
+        # Even subdivision includes the handle, with steps no longer than 5 cm.
+        count = 2*int(math.ceil((math.hypot(b[0]-a[0], b[1]-a[1])+4*abs(bend))/0.1)) if bend else 1
+        if len(sampled)+count > 2048:
+            raise ValueError('PATH_CURVE_LONG')
+        sampled.extend(curve_point(a, b, bend, i/count) for i in range(1, count))
+        sampled.append(b)
+    return sampled
+
+
 class LeaderTracker(object):
     ACTIVE = ('TRACKING', 'ALIGNING')
 
     def __init__(self):
         self.points, self.segments = [], []
+        self.waypoints = []
         self.progress = self.total = 0.0
         self.state, self.reason = 'IDLE', ''
         self.v = self.w = 0.0
@@ -72,13 +99,15 @@ class LeaderTracker(object):
         self.cross_track = self.heading_error = 0.0
         self.acceleration, self.angular_acceleration = 0.15, 0.8
 
-    def start(self, points, speed, lookahead, pose, now):
-        points = validate_points(points)
+    def start(self, points, speed, lookahead, pose, now, bends=None):
+        waypoints = validate_points(points)
+        points = sample_path(waypoints, bends)
         if not finite(speed) or not 0 < speed <= 0.5 or not finite(lookahead) or not 0.3 <= lookahead <= 0.5:
             raise ValueError('PATH_SETTINGS')
         if math.hypot(points[0][0]-pose[0], points[0][1]-pose[1]) > 0.5:
             raise ValueError('START_TOO_FAR')
         self.__init__()
+        self.waypoints = waypoints
         self.points, self.speed, self.lookahead = points, speed, lookahead
         for a, b in zip(points, points[1:]):
             length = math.hypot(b[0]-a[0], b[1]-a[1])
@@ -189,7 +218,8 @@ class LeaderTracker(object):
         return self.v, self.w
 
     def status(self):
-        return dict(state=self.state, reason=self.reason, points=self.points, progress=self.progress,
+        return dict(state=self.state, reason=self.reason, points=self.points, waypoints=self.waypoints, progress=self.progress,
+                    curves_supported=True,
                     total=self.total, target=self.target, reference=self.reference,
                     cross_track=self.cross_track, heading_error=self.heading_error,
                     linear=self.v, angular=self.w)

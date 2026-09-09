@@ -17,7 +17,7 @@ import yaml
 from fleet_deploy import (read_robot_config, robot_number, run_remote, shell_path,
                           update_config)
 from fleet_terminal import Terminal
-from leader_tracker import parse_points, check_bounds
+from leader_tracker import parse_points, check_bounds, curve_point, sample_path
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCALIZATION = ROOT / 'src/five_ugv_uwb_localization'
@@ -26,6 +26,7 @@ DEFAULTS = {
     'anchors_json': '',
     'linear_limit': '',
     'leader_control_mode': 'keyboard', 'leader_path': '2.0, 2.2\n3.0, 2.2\n3.0, 2.8',
+    'leader_path_bends': '[]',
     'path_speed': '0.10', 'path_lookahead': '0.40',
     'active_tab': '0', 'formation_step': '0', 'fold_logs': True,
 }
@@ -43,6 +44,8 @@ TRACKING_TEXT = {
     'ZERO_LIMIT': '线速度上限为零', 'PATH_ERROR': '偏离当前路径超过 0.6 m，请检查定位或手动移回',
     'PATH_POINTS': '请填写 2–50 个坐标点，每行两个有限数值 X, Y',
     'PATH_SEGMENT_SHORT': '相邻路径点距离至少 0.15 m',
+    'PATH_CURVES': '曲线设置无效，请重新编辑路径',
+    'PATH_CURVE_LONG': '曲线路径过长，请减少弯曲幅度或路径点',
     'PATH_OUTSIDE': '路径超出基站范围或没有足够的车体 / 编队转弯余量',
     'PATH_SETTINGS': '巡航速度需在 0–0.5 m/s（不含 0），预瞄距离需在 0.3–0.5 m',
     'START_TOO_FAR': '路径起点距领航车超过 0.5 m，请使用当前位置或先手动移至起点',
@@ -80,6 +83,8 @@ def localization_config(encoded=''):
     if encoded:
         custom = json.loads(encoded)
         base.update(anchors=custom['anchors'], tag_height=custom['tag_height'])
+        if 'valid_max_residual_rms' in custom:
+            base['valid_max_residual_rms'] = custom['valid_max_residual_rms']
     anchors = base['anchors']
     if len(anchors) < base['min_anchors']:
         raise ValueError('定位至少需要 %d 个基站' % base['min_anchors'])
@@ -91,6 +96,10 @@ def localization_config(encoded=''):
             raise ValueError('坐标和高度必须是有限数值，单位米')
     if base['tag_height'] < 0 or any(a['z'] < 0 for a in anchors):
         raise ValueError('高度不能小于零')
+    residual_limit = base['valid_max_residual_rms']
+    if (isinstance(residual_limit, bool) or not isinstance(residual_limit, (int, float)) or
+            not math.isfinite(residual_limit) or residual_limit <= 0):
+        raise ValueError('有效残差阈值必须是大于 0 的有限数值（米）')
     a = anchors[0]
     if not any(abs((b['x'] - a['x']) * (c['y'] - a['y']) -
                    (b['y'] - a['y']) * (c['x'] - a['x'])) > 1e-5 for b in anchors for c in anchors):
@@ -234,6 +243,7 @@ class FleetWorkbench:
         self.control_dialog = self.keyboard = None
         self.path_preview, self.tracking = [], {}
         self.path_picking, self.map_transform = False, None
+        self.path_bends, self.path_drag = [], None
         self.keys_down, self.key_releases = set(), {}
         self.keyboard_keys = set()
         self.run_id = uuid.uuid4().hex
@@ -921,9 +931,17 @@ class FleetWorkbench:
         self.path_editor = self.tk.Text(path, height=5, width=40)
         self.path_editor.pack(fill='x', pady=5)
         self.path_editor.insert('1.0', self.app.vars['leader_path'].get())
+        try:
+            self.path_preview, self.path_bends = self.read_path(min_points=0)
+        except ValueError:
+            self.path_preview, self.path_bends = [], []
         def remember(_=None):
             if self.path_editor.edit_modified():
-                self.app.vars['leader_path'].set(self.path_editor.get('1.0', 'end-1c'))
+                text = self.path_editor.get('1.0', 'end-1c')
+                if text != self.app.vars['leader_path'].get():
+                    self.path_preview, self.path_bends = [], []
+                    self.app.vars['leader_path_bends'].set('[]')
+                    self.app.vars['leader_path'].set(text)
                 self.path_editor.edit_modified(False)
         self.path_editor.bind('<<Modified>>', remember)
         edit = self.ttk.Frame(path)
@@ -938,7 +956,7 @@ class FleetWorkbench:
         for label, key in [('巡航 m/s', 'path_speed'), ('预瞄 m', 'path_lookahead')]:
             self.ttk.Label(fields, text=label).pack(side='left', padx=(5, 3))
             self.ttk.Entry(fields, textvariable=self.app.vars[key], width=7).pack(side='left')
-        self.ttk.Label(path, text='先预览再开始；预瞄 0.3–0.5 m，建议巡航 0.10 m/s。关闭弹窗会暂停。').pack(anchor='w', pady=4)
+        self.ttk.Label(path, text='地图中可拖动线段设置曲线；手动修改坐标会恢复直线。\n先预览再开始；预瞄 0.3–0.5 m，建议巡航 0.10 m/s。关闭弹窗会暂停。').pack(anchor='w', pady=4)
         actions = self.ttk.Frame(path)
         actions.pack(fill='x', pady=4)
         self.ttk.Button(actions, text='预览路径', command=self.preview_path).pack(side='left', padx=(0, 8))
@@ -962,6 +980,7 @@ class FleetWorkbench:
                 raise ValueError('请先暂停，再编辑、预览或开始新路径')
 
     def set_path_picking(self, enabled):
+        self.path_drag = None
         self.path_picking = enabled
         self.canvas.configure(cursor='crosshair' if enabled else '')
         if enabled:
@@ -976,9 +995,9 @@ class FleetWorkbench:
             self.app.messagebox.showerror('参考路径', str(error), parent=self.control_dialog)
             return
         self.armed.set(False)
-        self.path_pick_status.set('左键按顺序添加点，右键撤销末点；选好后点击“完成选点”。')
+        self.path_pick_status.set('左键空白处添加点；拖动线段 / 中点圆环设置曲线；右键线段恢复直线，右键空白处撤销末点。')
         try:
-            self.path_preview = parse_points(self.path_editor.get('1.0', 'end-1c'), min_points=0)
+            self.path_preview, self.path_bends = self.read_path(min_points=0)
         except ValueError as error:
             self.path_preview = []
             self.path_pick_status.set(TRACKING_TEXT.get(str(error), str(error)) + '；可清空路径后重新选点。')
@@ -987,9 +1006,26 @@ class FleetWorkbench:
         self.control_dialog.withdraw()
         self.paint_map(time.monotonic())
 
+    def read_path(self, min_points=2):
+        points = parse_points(self.path_editor.get('1.0', 'end-1c'), min_points=min_points)
+        bends = json.loads(self.app.vars['leader_path_bends'].get())
+        sample_path(points, bends, min_points=min_points)
+        return points, bends or [0.0] * max(0, len(points)-1)
+
+    def check_curve_bounds(self, points, bends):
+        sampled = sample_path(points, bends, min_points=0)
+        config = localization_config(self.app.vars['anchors_json'].get())
+        offsets = list(self.active_offsets.values()) if self.monitor and self.monitor.enable else []
+        check_bounds(sampled, path_bounds(config), offsets)
+
+    def save_path_bends(self, bends):
+        self.path_bends = bends
+        self.app.vars['leader_path_bends'].set(json.dumps(bends))
+
     def edit_path(self, action, point=None):
         try:
             self.check_path_editable()
+            self.path_drag = None
             lines = [line for line in self.path_editor.get('1.0', 'end-1c').splitlines() if line.strip()]
             if action == 'clear':
                 lines = []
@@ -1003,16 +1039,19 @@ class FleetWorkbench:
                     raise ValueError('领航车定位无效或过期，请连接实时监视')
                 lines = ['%.4f, %.4f' % tuple(self.samples[number]['pose']['value'])] + lines[1:]
             points = parse_points('\n'.join(lines), min_points=0)
+            bends = self.path_bends[:max(0, len(points)-1)]
+            bends += [0.0] * max(0, len(points)-1-len(bends))
+            if action == 'current' and bends:
+                bends[0] = 0.0
             if action in ('append', 'current'):
-                config = localization_config(self.app.vars['anchors_json'].get())
-                offsets = list(self.active_offsets.values()) if self.monitor and self.monitor.enable else []
-                check_bounds(points, path_bounds(config), offsets)
+                self.check_curve_bounds(points, bends)
             text = '\n'.join('%.4f, %.4f' % p for p in points)
             self.path_editor.delete('1.0', 'end')
             self.path_editor.insert('1.0', text)
             self.app.vars['leader_path'].set(text)
+            self.save_path_bends(bends)
             self.path_preview = points
-            self.path_pick_status.set('已选 %d 个点；左键添加，右键撤销。%s' %
+            self.path_pick_status.set('已选 %d 个点；拖动线段设置曲线，右键线段恢复直线，右键空白处撤销末点。%s' %
                                       (len(points), '至少需要两点。' if len(points) < 2 else '选好后点击“完成选点”。'))
             self.paint_map(time.monotonic())
         except ValueError as error:
@@ -1026,6 +1065,28 @@ class FleetWorkbench:
         self.canvas.focus_set()
         if not self.path_picking:
             return
+        self.path_drag = None
+        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        items = self.canvas.find_overlapping(x-6, y-6, x+6, y+6)
+        tags = [tag for item in reversed(items) for tag in self.canvas.gettags(item)]
+        segment = next((int(tag.split(':')[1]) for tag in tags if tag.startswith('path_segment:')), None)
+        if segment is not None:
+            try:
+                self.check_path_editable()
+                if event.num == 3:
+                    bends = list(self.path_bends)
+                    bends[segment] = 0.0
+                    self.check_curve_bounds(self.path_preview, bends)
+                    self.save_path_bends(bends)
+                    self.path_pick_status.set('该段已恢复直线；可再次拖动调整。')
+                    self.paint_map(time.monotonic())
+                else:
+                    self.path_drag = dict(index=segment, start=(x, y), transform=self.map_transform,
+                                          bends=list(self.path_bends), valid=False)
+                    self.path_pick_status.set('拖动调整弯曲幅度，松开鼠标保存；两端路径点保持不变。')
+            except ValueError as error:
+                self.path_pick_status.set(TRACKING_TEXT.get(str(error), str(error)))
+            return
         if event.num == 3:
             self.edit_path('undo')
         elif self.map_transform:
@@ -1033,13 +1094,44 @@ class FleetWorkbench:
             self.edit_path('append', ((self.canvas.canvasx(event.x) - ox) / scale,
                                       (oy - self.canvas.canvasy(event.y)) / scale))
 
+    def drag_path_curve(self, event):
+        drag = self.path_drag
+        if not drag:
+            return
+        drag['valid'] = False
+        try:
+            self.check_path_editable()
+            index = drag['index']
+            a, b = self.path_preview[index:index+2]
+            dx, dy = b[0]-a[0], b[1]-a[1]
+            scale = drag['transform'][2]
+            mx = (self.canvas.canvasx(event.x)-drag['start'][0])/scale
+            my = (drag['start'][1]-self.canvas.canvasy(event.y))/scale
+            bends = list(self.path_bends)
+            bends[index] = round(bends[index]+(-dy*mx+dx*my)/math.hypot(dx, dy), 4)
+            self.check_curve_bounds(self.path_preview, bends)
+            drag.update(bends=bends, valid=True)
+            self.path_pick_status.set('弯曲幅度 %.2f m；松开鼠标保存。' % abs(bends[index]))
+        except ValueError as error:
+            self.path_pick_status.set(TRACKING_TEXT.get(str(error), str(error)) + '；本次拖动未保存。')
+        self.paint_map(time.monotonic())
+
+    def finish_path_curve(self, event):
+        if not self.path_drag:
+            return
+        self.drag_path_curve(event)
+        drag, self.path_drag = self.path_drag, None
+        if drag['valid']:
+            self.save_path_bends(drag['bends'])
+            self.path_pick_status.set('曲线已保存；右键该线段可恢复直线，选好后点击“完成选点”。')
+        self.paint_map(time.monotonic())
+
     def preview_path(self):
         try:
             self.check_path_editable()
-            points = parse_points(self.path_editor.get('1.0', 'end-1c'))
-            config = localization_config(self.app.vars['anchors_json'].get())
-            offsets = list(self.active_offsets.values()) if self.monitor and self.monitor.enable else []
-            check_bounds(points, path_bounds(config), offsets)
+            points, bends = self.read_path()
+            self.check_curve_bounds(points, bends)
+            self.path_bends = bends
             self.path_preview = points
             self.app.vars['leader_path'].set(self.path_editor.get('1.0', 'end-1c'))
             self.app.save()
@@ -1061,11 +1153,13 @@ class FleetWorkbench:
                 points = self.preview_path()
                 if points is None:
                     return
+                if any(self.path_bends) and not self.monitor.tracking.get('curves_supported'):
+                    raise ValueError('请重新连接实时监视以加载曲线路径功能')
                 speed = float(self.app.vars['path_speed'].get())
                 lookahead = float(self.app.vars['path_lookahead'].get())
                 if not 0 < speed <= 0.5 or not 0.3 <= lookahead <= 0.5:
                     raise ValueError('PATH_SETTINGS')
-                values = dict(points=points, speed=speed, lookahead=lookahead)
+                values = dict(points=points, bends=self.path_bends, speed=speed, lookahead=lookahead)
             self.send_control(action, **values)
             self.leader_status.set('正在发送领航控制指令…')
         except ValueError as error:
@@ -1078,7 +1172,7 @@ class FleetWorkbench:
         toolbar.pack(fill='x')
         self.ttk.Button(toolbar, text='连接实时监视', command=lambda: self.start('monitor')).pack(side='left')
         self.ttk.Button(toolbar, text='启动 IOT 实时监视', command=self.open_iot).pack(side='left', padx=6)
-        self.ttk.Button(toolbar, text='编辑基站坐标 / 高度', command=self.edit_anchors).pack(side='left', padx=8)
+        self.ttk.Button(toolbar, text='编辑基站坐标 / 定位参数', command=self.edit_anchors).pack(side='left', padx=8)
         self.ttk.Button(toolbar, text='清空轨迹', command=self.clear_trails).pack(side='left')
         self.ttk.Button(toolbar, text='立即停车 / 禁用跟随', command=self.emergency).pack(side='right')
         self.ttk.Button(toolbar, text='领航控制…', command=self.open_leader_control).pack(side='left', padx=8)
@@ -1101,6 +1195,8 @@ class FleetWorkbench:
         self.canvas.pack(fill='both', expand=True)
         self.canvas.bind('<Button-1>', self.map_path_click)
         self.canvas.bind('<Button-3>', self.map_path_click)
+        self.canvas.bind('<B1-Motion>', self.drag_path_curve)
+        self.canvas.bind('<ButtonRelease-1>', self.finish_path_curve)
         self.canvas.bind('<Configure>', lambda _: self.paint_map(time.monotonic()))
         self.path_tools = self.ttk.Frame(page)
         buttons = self.ttk.Frame(self.path_tools)
@@ -1123,8 +1219,8 @@ class FleetWorkbench:
 
     def edit_anchors(self):
         dialog = self.tk.Toplevel(self.root)
-        dialog.title('基站坐标与高度（米）')
-        dialog.geometry('610x510')
+        dialog.title('基站坐标与定位参数')
+        dialog.geometry('610x530')
         config = localization_config(self.app.vars['anchors_json'].get())
         table = self.ttk.Treeview(dialog, columns=('id', 'x', 'y', 'z'), show='headings', height=9)
         for key in ('id', 'x', 'y', 'z'):
@@ -1165,6 +1261,9 @@ class FleetWorkbench:
         height_row.pack()
         self.ttk.Label(height_row, text='车载标签高度 Z（米）').pack(side='left')
         self.ttk.Entry(height_row, textvariable=height, width=10).pack(side='left')
+        residual_limit = self.tk.StringVar(value=str(config['valid_max_residual_rms']))
+        self.ttk.Label(height_row, text='有效残差阈值（米）').pack(side='left', padx=(18, 0))
+        self.ttk.Entry(height_row, textvariable=residual_limit, width=10).pack(side='left')
         self.ttk.Label(dialog, text='保存后地图立即更新；下次“底盘与定位”启动时上传完整定位配置。\n已运行的定位节点需先停止再启动，修改行后请点击“修改选中行”。',
                        wraplength=560).pack(pady=7)
         def save(reset=False):
@@ -1173,7 +1272,9 @@ class FleetWorkbench:
                 for item in table.get_children():
                     value = table.item(item, 'values')
                     anchors.append(dict(id=int(value[0]), x=float(value[1]), y=float(value[2]), z=float(value[3])))
-                encoded = '' if reset else json.dumps(dict(anchors=anchors, tag_height=float(height.get())))
+                encoded = '' if reset else json.dumps(dict(
+                    anchors=anchors, tag_height=float(height.get()),
+                    valid_max_residual_rms=float(residual_limit.get())))
                 localization_config(encoded)
                 self.app.vars['anchors_json'].set(encoded)
                 self.app.save()
@@ -1201,10 +1302,17 @@ class FleetWorkbench:
         config = localization_config(self.app.vars['anchors_json'].get())
         anchors = config['anchors']
         points = [(a['x'], a['y']) for a in anchors]
-        path = self.path_preview
-        if (not self.path_picking and self.monitor and self.monitor.ready and
-                self.tracking.get('state') in ('TRACKING', 'ALIGNING')):
+        waypoints = self.path_preview
+        bends = self.path_drag['bends'] if self.path_drag and self.path_drag['valid'] else self.path_bends
+        active = (not self.path_picking and self.monitor and self.monitor.ready and
+                  self.tracking.get('state') in ('TRACKING', 'ALIGNING'))
+        if active:
             path = self.tracking.get('points', [])
+            waypoints = self.tracking.get('waypoints', path)
+            sections = [path] if len(path) > 1 else []
+        else:
+            sections = [sample_path([a, b], [bend]) for a, b, bend in zip(waypoints, waypoints[1:], bends)]
+            path = [p for section in sections for p in section] or waypoints
         points.extend(path)
         for row in self.samples.values():
             for key in ('pose', 'target'):
@@ -1214,6 +1322,8 @@ class FleetWorkbench:
         ymin, ymax = min(p[1] for p in points) - 1, max(p[1] for p in points) + 1
         scale = min((width - 90) / max(1, xmax - xmin), (height - 65) / max(1, ymax - ymin))
         ox, oy = width / 2 - (xmin + xmax) / 2 * scale, height / 2 + (ymin + ymax) / 2 * scale
+        if self.path_drag:
+            ox, oy, scale = self.path_drag['transform']
         self.map_transform = (ox, oy, scale)
         def xy(point):
             return ox + point[0] * scale, oy - point[1] * scale
@@ -1233,9 +1343,14 @@ class FleetWorkbench:
             x, y = xy((a['x'], a['y']))
             canvas.create_polygon(x, y - 8, x - 7, y + 6, x + 7, y + 6, fill='#334155')
             canvas.create_text(x, y - 20, text='A%s · z=%.2f' % (a['id'], a['z']), fill='#334155')
-        if len(path) > 1:
-            canvas.create_line(*[v for point in path for v in xy(point)], fill='#7c3aed', width=2, dash=(8, 4), tags='reference_path')
-        for index, point in enumerate(path):
+        for index, section in enumerate(sections):
+            tags = ('reference_path', 'path_segment:%d' % index)
+            canvas.create_line(*[v for point in section for v in xy(point)], fill='#7c3aed', width=2, dash=(8, 4), tags=tags)
+            if self.path_picking:
+                x, y = xy(curve_point(waypoints[index], waypoints[index+1], bends[index], 0.5))
+                canvas.create_oval(x-6, y-6, x+6, y+6, fill='white', outline='#7c3aed', width=2,
+                                   tags=('curve_handle', tags[1]))
+        for index, point in enumerate(waypoints):
             x, y = xy(point)
             canvas.create_oval(x-4, y-4, x+4, y+4, fill='#7c3aed', outline='white', tags='path_point')
             canvas.create_text(x+5, y-10, text='P%d' % index, fill='#7c3aed', anchor='w')
@@ -1285,8 +1400,9 @@ class FleetWorkbench:
                            (number, pose[0], pose[1], error_text, rms, state_text + ' · UWB ' +
                             (row.get('uwb_status', {}).get('value', '—') if row.get('uwb_status', {}).get('age', 999) + now-self.last_sample < 0.6 else '数据过期')))
         online = self.monitor and self.monitor.ready and now - self.last_sample < 2
-        self.map_status.set('%s · 基站 %d 个 · 标签高度 %.2f m · %s' %
+        self.map_status.set('%s · 基站 %d 个 · 标签高度 %.2f m · 有效残差阈值 %.2f m · %s' %
                             ('实时监视已连接' if online else '实时监视未连接 / 数据过期', len(anchors), config['tag_height'],
+                             config['valid_max_residual_rms'],
                              '自定义基站（新启动定位时生效）' if self.app.vars['anchors_json'].get() else '代码默认基站'))
         self.metrics.set('\n'.join(metrics) if metrics else '暂无实时误差数据。领航航向对齐到 UWB 地图；跟随车航向以连接时的朝向为 +X 参考。')
 

@@ -13,7 +13,7 @@ import threading
 import time
 
 from fleet_bridge import monotonic, velocity
-from leader_tracker import LeaderTracker, TrackingLog, check_bounds, finite, wrap, validate_points
+from leader_tracker import LeaderTracker, TrackingLog, check_bounds, finite, wrap, sample_path
 
 
 def emit(data):
@@ -342,10 +342,10 @@ def main():
                                     raise ValueError(problem)
                                 if action == 'start':
                                     points = request.get('points', [])
-                                    points = validate_points(points)
-                                    check_bounds(points, bounds, list(offsets.values()) if enable_sent else [])
+                                    bends = request.get('bends')
+                                    check_bounds(sample_path(points, bends), bounds, list(offsets.values()) if enable_sent else [])
                                     tracker.start(points, float(request.get('speed', 0.1)),
-                                                  float(request.get('lookahead', 0.4)), pose, monotonic())
+                                                  float(request.get('lookahead', 0.4)), pose, monotonic(), bends=bends)
                                     if tracking_log:
                                         tracking_log.close()
                                         tracking_log = None
