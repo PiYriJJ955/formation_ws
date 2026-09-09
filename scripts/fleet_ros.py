@@ -88,7 +88,10 @@ def main():
     parser.add_argument('--offsets', default='{}')
     parser.add_argument('--bounds', default='')
     parser.add_argument('--timeout', type=float, default=45)
+    parser.add_argument('--data-timeout', type=float, default=0.6)
     args = parser.parse_args()
+    if not finite(args.data_timeout) or args.data_timeout <= 0:
+        parser.error('--data-timeout must be a finite number greater than zero')
     ids = [int(value) for value in args.ids.split(',')]
     if args.mode == 'check':
         if args.step == 'chassis':
@@ -214,7 +217,7 @@ def main():
         if not row.get('valid', (False, 0))[0]:
             alignment['stationary_since'] = None
             return None, 'UWB_INVALID'
-        if any(now-row.get(key, (None, -1e9))[1] > 0.5
+        if any(now-row.get(key, (None, -1e9))[1] > args.data_timeout
                for key in ('pose', 'valid', 'yaw', 'fusion_yaw', 'velocity')):
             alignment['stationary_since'] = None
             return None, 'STALE_INPUT'
@@ -242,7 +245,7 @@ def main():
             with lock:
                 row = dict(cache.get(str(number), {}))
             if (not row.get('valid', (False, 0))[0] or
-                    any(now-row.get(key, (None, -1e9))[1] > 0.5 for key in ('pose', 'valid'))):
+                    any(now-row.get(key, (None, -1e9))[1] > args.data_timeout for key in ('pose', 'valid'))):
                 return 'FOLLOWER_INVALID'
         if not all(row['ready'] for row in limit_status().values()):
             return 'LIMIT_PENDING'

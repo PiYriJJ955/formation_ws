@@ -25,12 +25,25 @@ from fleet_deploy import replace_master, update_master, read_robot_config, grant
 
 
 class ConsoleChecks(unittest.TestCase):
+    def test_new_computer_uses_its_own_server_and_remembers_selected_repository(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('fleet_console.local_git_urls', return_value=['http://192.168.8.25:8000/formation.git']):
+            path = Path(directory) / 'settings.json'
+            options, robots = load_settings(path)
+            self.assertEqual(options['repository'], 'http://192.168.8.25:8000/formation.git')
+            options['repository'] = 'https://git.example.com/formation.git'
+            save_settings(path, options, robots)
+            self.assertEqual(load_settings(path)[0]['repository'], options['repository'])
+
     def test_git_server_starts_once_and_tracks_service_changes(self):
         events, stopped = queue.Queue(), Mock()
         stopped.is_set.side_effect = [False, False, False, False, True]
         states = [(0, ''), (0, 'active'), (3, 'inactive'), (3, 'failed'), (0, 'active')]
         with patch('fleet_console.subprocess.run', side_effect=[
-                subprocess.CompletedProcess([], code, state + '\n', '') for code, state in states]) as run:
+                subprocess.CompletedProcess([], code, state + '\n', '') for code, state in states]) as run, \
+                patch('fleet_console.server_info', return_value={'authentication': 'password'}), \
+                patch('fleet_console.local_git_urls', side_effect=[['http://10.1.2.3:8000/formation.git'], [], [],
+                                                                 ['http://10.1.2.4:8000/formation.git']]):
             watch_git_server(events, stopped)
         self.assertEqual([call[0][0] for call in run.call_args_list],
                          [['systemctl', '--user', 'start', 'formation-git-http.service']] +
@@ -40,6 +53,8 @@ class ConsoleChecks(unittest.TestCase):
             self.assertEqual(event, 'git_server')
             self.assertIn(expected, data['text'])
             self.assertEqual(data['running'], running)
+            if running:
+                self.assertIn(data['urls'][0], data['text'])
         self.assertEqual(stopped.wait.call_count, 4)
 
     def test_git_server_reports_start_and_status_errors_then_recovers(self):
@@ -53,7 +68,9 @@ class ConsoleChecks(unittest.TestCase):
                         subprocess.CompletedProcess([], 3, 'inactive\n', ''),
                         subprocess.TimeoutExpired('systemctl', 3),
                         subprocess.CompletedProcess([], 0, 'active\n', ''),
-                        subprocess.CompletedProcess([], 3, 'inactive\n', '')]):
+                        subprocess.CompletedProcess([], 3, 'inactive\n', '')]), \
+                        patch('fleet_console.server_info', return_value={'authentication': 'password'}), \
+                        patch('fleet_console.local_git_urls', return_value=[]):
                     watch_git_server(events, stopped)
                 data = events.get_nowait()[2]
                 self.assertFalse(data['running'])
@@ -62,6 +79,17 @@ class ConsoleChecks(unittest.TestCase):
                 self.assertIn('状态检查失败', events.get_nowait()[2]['text'])
                 self.assertTrue(events.get_nowait()[2]['running'])
                 self.assertEqual(events.get_nowait()[2]['text'], 'Git server：未运行')
+
+    def test_git_server_requires_http_push_health_not_just_an_active_process(self):
+        events, stopped = queue.Queue(), Mock()
+        stopped.is_set.side_effect = [False, True]
+        with patch('fleet_console.subprocess.run', return_value=subprocess.CompletedProcess([], 0, 'active\n', '')), \
+                patch('fleet_console.server_info', side_effect=ValueError('请安装并重启 Git HTTP 服务')), \
+                patch('fleet_console.local_git_urls', return_value=[]):
+            watch_git_server(events, stopped)
+        data = events.get_nowait()[2]
+        self.assertFalse(data['running'])
+        self.assertIn('请安装并重启', data['text'])
 
     def test_serial_permissions_stdin_sudo_and_device_failures(self):
         # Run the real shell command against temporary files and a fake sudo.

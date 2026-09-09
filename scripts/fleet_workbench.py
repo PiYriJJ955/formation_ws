@@ -28,6 +28,7 @@ DEFAULTS = {
     'leader_control_mode': 'keyboard', 'leader_path': '2.0, 2.2\n3.0, 2.2\n3.0, 2.8',
     'leader_path_bends': '[]',
     'path_speed': '0.10', 'path_lookahead': '0.40',
+    'data_timeout': '0.6',
     'active_tab': '0', 'formation_step': '0', 'fold_logs': True,
 }
 COLORS = ['#1976d2', '#e76622', '#009688', '#9b51b6', '#c0395a', '#8a7600']
@@ -75,6 +76,16 @@ def saved_linear_limit(options):
 def session_limits(options, identities):
     value = saved_linear_limit(options)
     return {str(number): value for number in identities.values()}
+
+
+def saved_data_timeout(options):
+    value = options.get('data_timeout', 0.6)
+    if isinstance(value, bool):
+        raise ValueError('数据过期阈值必须是大于 0 的有限秒数')
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError('数据过期阈值必须是大于 0 的有限秒数')
+    return value
 
 
 @lru_cache(maxsize=16)
@@ -133,8 +144,9 @@ def launch_command(step, options, ip, name, remote, row=None):
         if number == leader:
             raise ValueError('领航车不启动跟随控制器')
         command = ('%s check --step follower --ids %d; exec flock -n "$HOME/.cache/formation-console/follower.lock" '
-                   'roslaunch five_ugv_formation_control follower.launch ugv_id:=%d leader_id:=%d auto_enable:=false max_linear:=%s' %
-                   (helper, number, number, leader, saved_linear_limit(options)))
+                   'roslaunch five_ugv_formation_control follower.launch ugv_id:=%d leader_id:=%d auto_enable:=false '
+                   'max_linear:=%s data_timeout:=%s' %
+                   (helper, number, number, leader, saved_linear_limit(options), saved_data_timeout(options)))
     else:
         raise ValueError('未知启动步骤')
     return ros_command(options, ip, command)
@@ -445,6 +457,7 @@ class FleetWorkbench:
         try:
             options = self.app.current_options()
             saved_linear_limit(options)
+            saved_data_timeout(options)
             addresses = self.addresses()
             ipaddress.IPv4Address(options['master_ip'])
             robot_number(options['leader'])
@@ -617,10 +630,10 @@ class FleetWorkbench:
                                for ip, row in rows.items() if row['robot_id'] != options['leader']}
                     identities = {ip: robot_number(row['robot_id']) for ip, row in rows.items()}
                     limits = session_limits(options, identities)
-                    command = ros_command(options, master, 'python -u %s/fleet_ros.py monitor --ids %s --leader %d --linear-limits %s --offsets %s --bounds=%s' %
+                    command = ros_command(options, master, 'python -u %s/fleet_ros.py monitor --ids %s --leader %d --linear-limits %s --offsets %s --bounds=%s --data-timeout %s' %
                                           (shlex.quote(remotes[master]), ','.join(map(str, ids)), robot_number(options['leader']),
                                            shlex.quote(json.dumps(limits)), shlex.quote(json.dumps(offsets)),
-                                           ','.join(str(v) for v in path_bounds(config))))
+                                           ','.join(str(v) for v in path_bounds(config)), saved_data_timeout(options)))
                     self.monitor = Monitor(clients.pop(master), command, self.events, limits)
                     self.events.put(('monitor_started', ids, options['leader'], identities, offsets))
                     deadline = time.monotonic() + 20
@@ -1185,6 +1198,10 @@ class FleetWorkbench:
                         textvariable=self.limit_input).pack(side='left')
         self.ttk.Button(limits, text='应用到全部', command=self.apply_limits).pack(side='left', padx=8)
         self.ttk.Label(limits, text='0–0.5；0 时路径暂停').pack(side='left')
+        self.ttk.Label(limits, text='数据过期秒数').pack(side='left', padx=(14, 5))
+        self.tk.Spinbox(limits, from_=0.05, to=5.0, increment=0.05, width=7,
+                        textvariable=self.app.vars['data_timeout']).pack(side='left')
+        self.ttk.Label(limits, text='重连监视 / 重启跟随后生效').pack(side='left', padx=(5, 0))
         self.limits_status = self.tk.StringVar()
         self.ttk.Label(limits, textvariable=self.limits_status, wraplength=430).pack(side='left', padx=10)
         self.refresh_limits()
@@ -1290,9 +1307,13 @@ class FleetWorkbench:
     def fresh(self, number, now):
         row = self.samples.get(number, {})
         delta = now - self.last_sample
+        try:
+            timeout = saved_data_timeout(self.app.current_options())
+        except (TypeError, ValueError):
+            timeout = 0.6
         return (row.get('valid', {}).get('value') is True and
-                row.get('valid', {}).get('age', 999) + delta < 0.6 and
-                row.get('pose', {}).get('age', 999) + delta < 0.6)
+                row.get('valid', {}).get('age', 999) + delta < timeout and
+                row.get('pose', {}).get('age', 999) + delta < timeout)
 
     def paint_map(self, now):
         canvas = self.canvas
@@ -1300,6 +1321,10 @@ class FleetWorkbench:
         if width < 100 or height < 100:
             return
         config = localization_config(self.app.vars['anchors_json'].get())
+        try:
+            data_timeout = saved_data_timeout(self.app.current_options())
+        except (TypeError, ValueError):
+            data_timeout = 0.6
         anchors = config['anchors']
         points = [(a['x'], a['y']) for a in anchors]
         waypoints = self.path_preview
@@ -1355,7 +1380,7 @@ class FleetWorkbench:
             canvas.create_oval(x-4, y-4, x+4, y+4, fill='#7c3aed', outline='white', tags='path_point')
             canvas.create_text(x+5, y-10, text='P%d' % index, fill='#7c3aed', anchor='w')
         lookahead = self.tracking.get('target')
-        if lookahead and now-self.last_sample < 0.6 and self.tracking.get('mode') == 'path':
+        if lookahead and now-self.last_sample < data_timeout and self.tracking.get('mode') == 'path':
             x, y = xy(lookahead)
             canvas.create_oval(x-5, y-5, x+5, y+5, outline='#7c3aed', width=2)
         metrics = []
@@ -1363,7 +1388,7 @@ class FleetWorkbench:
             row = self.samples[number]
             if 'pose' not in row:
                 status = row.get('uwb_status', {})
-                text = status.get('value', '等待定位') if status.get('age', 999) + now-self.last_sample < 0.6 else '等待定位数据'
+                text = status.get('value', '等待定位') if status.get('age', 999) + now-self.last_sample < data_timeout else '等待定位数据'
                 metrics.append('ugv%s · UWB %s' % (number, text))
                 continue
             valid = self.fresh(number, now)
@@ -1377,14 +1402,14 @@ class FleetWorkbench:
             if len(target_trail) > 1:
                 canvas.create_line(*[coordinate for point in target_trail for coordinate in xy(point)], fill=color, dash=(3, 4))
             target = row.get('target')
-            if target and target['age'] + now - self.last_sample < 0.6:
+            if target and target['age'] + now - self.last_sample < data_timeout:
                 tx, ty = xy(target['value'])
                 canvas.create_line(tx - 6, ty, tx + 6, ty, fill=color, width=2)
                 canvas.create_line(tx, ty - 6, tx, ty + 6, fill=color, width=2)
                 canvas.create_line(x, y, tx, ty, fill=color, dash=(4, 3))
             canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill=color, outline='white', width=2)
             heading = row.get('yaw')
-            if heading and heading['age'] + now - self.last_sample < 0.6:
+            if heading and heading['age'] + now - self.last_sample < data_timeout:
                 angle = heading['value'] - self.yaw_origin.setdefault(number, heading['value'])
                 if 'ugv'+number == getattr(self, 'active_leader', '') and self.tracking.get('yaw') is not None:
                     angle = self.tracking['yaw']
@@ -1392,13 +1417,13 @@ class FleetWorkbench:
             canvas.create_text(x + 10, y + 17, text='ugv' + number + ('' if valid else ' 过期/无效'), fill=color, anchor='w')
             error = row.get('error', {})
             state = row.get('state', {})
-            error_text = '%.3f m' % error['value'] if error.get('age', 999) + now - self.last_sample < 0.6 else '—'
-            state_text = state.get('value', '—') if state.get('age', 999) + now - self.last_sample < 0.6 else '数据过期'
+            error_text = '%.3f m' % error['value'] if error.get('age', 999) + now - self.last_sample < data_timeout else '—'
+            state_text = state.get('value', '—') if state.get('age', 999) + now - self.last_sample < data_timeout else '数据过期'
             errors = self.error_history.get(number, [])
             rms = '%.3f m' % math.sqrt(sum(v*v for v in errors) / len(errors)) if errors else '—'
             metrics.append('ugv%s  (%.2f, %.2f)  误差 %s  最近 1000 样本 RMS %s  %s' %
                            (number, pose[0], pose[1], error_text, rms, state_text + ' · UWB ' +
-                            (row.get('uwb_status', {}).get('value', '—') if row.get('uwb_status', {}).get('age', 999) + now-self.last_sample < 0.6 else '数据过期')))
+                            (row.get('uwb_status', {}).get('value', '—') if row.get('uwb_status', {}).get('age', 999) + now-self.last_sample < data_timeout else '数据过期')))
         online = self.monitor and self.monitor.ready and now - self.last_sample < 2
         self.map_status.set('%s · 基站 %d 个 · 标签高度 %.2f m · 有效残差阈值 %.2f m · %s' %
                             ('实时监视已连接' if online else '实时监视未连接 / 数据过期', len(anchors), config['tag_height'],

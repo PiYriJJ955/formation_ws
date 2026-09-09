@@ -6,6 +6,7 @@ import csv
 from contextlib import contextmanager
 from datetime import datetime
 import fcntl
+from http.client import HTTPException
 import ipaddress
 import json
 import math
@@ -26,6 +27,7 @@ import paramiko
 from fleet_deploy import (read_robot_config, sync_workspace, update_master, update_identity,
                           robot_number, grant_serial_permissions)
 from fleet_workbench import DEFAULTS as WORKBENCH_DEFAULTS
+from git_http_server import PASSWORD_FILE, server_info, local_git_urls
 
 
 CONFIG_DIR = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'formation-console'
@@ -62,24 +64,29 @@ def watch_git_server(events, stopped):
         startup_error = str(error)
     while not stopped.is_set():
         running = False
+        authentication = None
+        urls = local_git_urls()
         try:
             result = subprocess.run(command + ['is-active', service], stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, universal_newlines=True, timeout=3)
             state = result.stdout.strip()
-            running = result.returncode == 0 and state == 'active'
-            if running:
+            if result.returncode == 0 and state == 'active':
+                authentication = server_info()['authentication']
+                running = True
                 startup_error = ''
-                status = '运行中 · HTTP 端口 8000'
+                status = '运行中 · %s · %s · 点击查看连接方式' % (
+                    urls[0] if urls else '未检测到局域网 IPv4',
+                    '免密码推送' if authentication == 'none' else '密码推送')
             else:
                 status = {'inactive': '未运行', 'failed': '运行失败', 'activating': '正在启动…',
                           'deactivating': '正在停止…', 'reloading': '正在重载…'}.get(state, '不可用')
                 detail = startup_error or result.stderr.strip()
                 if detail:
                     status += '：' + detail
-        except (OSError, subprocess.TimeoutExpired) as error:
+        except (OSError, subprocess.TimeoutExpired, HTTPException, ValueError, KeyError) as error:
             status = '状态检查失败：' + str(error)
         events.put(('git_server', None, {'text': 'Git server：' + ' '.join(status.split())[:180],
-                                         'running': running}))
+                                         'running': running, 'authentication': authentication, 'urls': urls}))
         stopped.wait(3)
 
 
@@ -169,6 +176,10 @@ def load_settings(path):
             data = json.load(stream)
         options.update(data['options'])
         robots = data['robots']
+    else:
+        urls = local_git_urls()
+        if urls:
+            options['repository'] = urls[0]
     for ip in BLOCKED_IPS:
         robots.pop(ip, None)
     for key in ('selected', 'formation_selected'):
@@ -471,9 +482,12 @@ class FleetConsole:
         style.configure('Treeview', rowheight=30)
         style.configure('TButton', padding=6)
         self.git_status = tk.StringVar(value='Git server：正在启动…')
+        self.git_authentication = None
+        self.git_urls = []
         self.git_status_label = ttk.Label(root, textvariable=self.git_status, padding=(8, 4),
-                                          foreground='#ad6f00', wraplength=1080)
+                                          foreground='#ad6f00', wraplength=1080, cursor='hand2')
         self.git_status_label.pack(side='bottom', fill='x')
+        self.git_status_label.bind('<Button-1>', self.show_git_connection)
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill='both', expand=True)
         outer = ttk.Frame(self.notebook, padding=8)
@@ -596,6 +610,32 @@ class FleetConsole:
         if selected:
             self.table.selection_set(selected)
         self.root.after(50, self.poll)
+
+    def show_git_connection(self, _=None):
+        credentials = '推送：免密码'
+        if self.git_authentication != 'none':
+            try:
+                password = PASSWORD_FILE.read_text().strip()
+            except OSError:
+                password = '服务启动后可查看'
+            credentials = '推送用户名：formation\n推送密码：' + password
+        dialog = self.tk.Toplevel(self.root)
+        dialog.title('本机 Git server 连接信息')
+        dialog.transient(self.root)
+        text = self.tk.Text(dialog, width=78, height=20, wrap='word', padx=12, pady=12)
+        text.pack(fill='both', expand=True)
+        commands = '\n\n'.join('git remote add peer %s\ngit -c credential.helper= push peer master:master' % url
+                               for url in self.git_urls)
+        text.insert('end', '本机接收地址（自动检测）：\n%s\n\n%s\n\n'
+                    '在发送电脑的仓库终端执行以下命令；多网卡时选择同网段的地址：\n%s\n\n'
+                    '若 peer 已配置，用 git remote set-url peer 新地址 修改目标。\n'
+                    '推送时输入上方显示的用户名和密码。\n'
+                    'Windows / macOS / Linux 的 Git 使用相同命令。\n'
+                    '可选中文本后 Ctrl+C 复制。HTTP 适用于可信局域网。' % (
+                        '\n'.join(self.git_urls) or '等待本机网络地址；请确认已连接局域网。',
+                        credentials, commands or '获取本机局域网地址后自动生成。'))
+        text.configure(state='disabled')
+        self.ttk.Button(dialog, text='关闭', command=dialog.destroy).pack(pady=6)
 
     def entry(self, parent, label, key, row, col, width=16, span=1, **kwargs):
         self.ttk.Label(parent, text=label).grid(row=row, column=col, sticky='w', padx=(0, 6), pady=3)
@@ -1061,6 +1101,8 @@ class FleetConsole:
                 self.status.set(data['text'])
             elif event == 'git_server':
                 self.git_status.set(data['text'])
+                self.git_authentication = data.get('authentication')
+                self.git_urls = data.get('urls', [])
                 self.git_status_label.configure(foreground='#267346' if data['running'] else '#b52b33')
         if self.motion:
             session, velocity = self.motion

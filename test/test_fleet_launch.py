@@ -37,6 +37,10 @@ for vehicle in range(3):
             assert config.params[prefix + name + '/robot_name'].value == 'ugv%d' % vehicle
             assert config.params[prefix + name + '/cmd_vel_topic'].value == prefix + 'cmd_vel'
         assert config.params[prefix + 'formation_controller/enabled'].value is False
+        assert config.params[prefix + 'formation_controller/data_timeout'].value == 0.6
+        assert config.params[prefix + 'formation_controller/self_velocity_odom_topic'].value == prefix + 'odom'
+        assert config.params[prefix + 'formation_controller/k_position'].value == 0.5
+        assert config.params[prefix + 'formation_controller/rotate_exit_threshold'].value < config.params[prefix + 'formation_controller/rotate_in_place_threshold'].value
         assert config.params[prefix + 'formation_logger/controller_namespace'].value == prefix + 'formation_controller'
         assert config.params[prefix + 'formation_controller/leader_pose_topic'].value == '/ugv0/uwb/pose'
 
@@ -47,6 +51,9 @@ for limit in (0.0, 0.08, 0.5):
     config = resolve('five_ugv_formation_control', 'follower.launch',
                      ['ugv_id:=5', 'leader_id:=3', 'max_linear:=' + str(limit)])
     assert config.params['/ugv5/formation_controller/max_linear'].value == limit
+config = resolve('five_ugv_formation_control', 'follower.launch',
+                 ['ugv_id:=5', 'leader_id:=3', 'data_timeout:=0.85'])
+assert config.params['/ugv5/formation_controller/data_timeout'].value == 0.85
 print('Fleet launch checks passed for ugv0, ugv1 and ugv2.')
 
 with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml') as custom:

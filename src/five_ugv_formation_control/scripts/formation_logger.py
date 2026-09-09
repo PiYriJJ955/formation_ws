@@ -55,7 +55,7 @@ class FormationLogger(object):
         "follower_yaw", "follower_odom_stamp", "follower_odom_age",
         "target_x", "target_y", "target_yaw", "target_age",
         "error_x", "error_y", "error_norm", "heading_error", "error_age",
-        "heading_sync_error", "heading_blend",
+        "heading_sync_error", "heading_blend", "reference_angular",
         "leader_vx", "leader_vy", "leader_omega",
         "leader_odom_vx", "leader_odom_vy", "leader_odom_omega",
         "leader_velocity_odom_stamp", "leader_velocity_odom_age",
@@ -174,7 +174,7 @@ class FormationLogger(object):
         rospy.Subscriber(self.topic("heading_error_topic",
                                     "formation_controller/heading_error"),
                          Float64, self.number_cb, callback_args="heading_error", queue_size=50)
-        for name in ("heading_sync_error", "heading_blend", "max_linear"):
+        for name in ("heading_sync_error", "heading_blend", "max_linear", "reference_angular"):
             rospy.Subscriber(self.topic(name + "_topic", "formation_controller/" + name),
                              Float64, self.number_cb, callback_args=name, queue_size=50)
         rospy.Subscriber(self.topic("leader_cmd_vel_topic", "/ugv0/cmd_vel"),
@@ -385,6 +385,8 @@ class FormationLogger(object):
                      label=self.leader_name + " cmd angular z")
         axes[2].plot(t, self.numbers(rows, "cmd_angular_z"),
                      label=self.robot_name + " cmd angular z")
+        axes[2].plot(t, self.numbers(rows, "reference_angular"),
+                     label="target tangent angular velocity")
         axes[0].set_ylabel("velocity [m/s]"); axes[1].set_ylabel("speed [m/s]")
         axes[2].set_ylabel("angular [rad/s]"); axes[2].set_xlabel("time [s]")
         axes[0].set_title("Controller velocities")

@@ -25,7 +25,7 @@ ugv2–ugv4 新增 IOT 的 UID、固定串口、测距/测角实测结果和编�
 
 ```bash
 sudo apt update
-sudo apt install -y python3-pip python3-tk gnome-terminal
+sudo apt install -y git python3-pip python3-tk gnome-terminal
 python3 -m pip install --user --upgrade 'pip<22'
 python3 -m pip install --user -r requirements.txt
 ```
@@ -38,6 +38,9 @@ python3 scripts/fleet_console.py
 ```
 
 打开控制台会自动启动本机 Git HTTP 服务；窗口底部始终显示 Git server 状态，每 3 秒刷新。
+程序自动读取本机网卡 IP，在底部状态栏显示 Git 地址；每 3 秒刷新，地址随网络变化更新。
+点击状态可查看本机接收地址、推送凭据和已填入实际 IP 的推送命令；多网卡时列出各个可用地址。
+新电脑首次运行时，“Git 仓库地址”默认使用检测到的本机地址；手动设置的仓库地址会记住。
 服务未运行或启动失败时显示异常状态。关闭控制台后服务继续运行，供小车完成更新；主机重启后随下次打开控制台启动。
 `--check-gui` 只检查桌面环境。
 
@@ -190,7 +193,7 @@ ROS Master 和手动 SSH 各自使用独立的窗口。同类任务以标签页�
 路径跟踪以 20 Hz 在 ROS Master 主机的监视进程中计算，GUI 只发送设置和控制操作。
 所有领航速度经过同一个出口选择与限幅，切换模式时清零。拐角会平滑转向，实际轨迹可能在拐点内侧切弯；
 起步方向偏差较大时先转向。接近终点减速，到终点 0.10 m 内停止。
-定位无效、数据超过 0.5 秒、明显位置跳变、偏离当前路径超过 0.6 m 或底盘断开时暂停，恢复后需手动继续。
+定位无效、数据超过可调的过期阈值（默认 0.6 秒）、明显位置跳变、偏离当前路径超过 0.6 m 或底盘断开时暂停，恢复后需手动继续。
 控制心跳过期 0.4 秒会停车并禁用跟随，重连后不会自动恢复路径。
 Esc、键盘控制区内的空格键，以及“立即停车 / 禁用跟随”按钮可停领航车并禁用跟随。
 普通路径暂停允许有效的跟随车继续收敛到其队形目标。
@@ -212,7 +215,8 @@ Esc、键盘控制区内的空格键，以及“立即停车 / 禁用跟随”�
 
 图上显示基站、各车 UWB 位置、实际轨迹、目标轨迹和误差连线；下方显示各车控制器状态、
 当前跟踪误差与最近最多 1000 个采样的误差 RMS。轨迹同样限制为 1000 点。
-定位无效或超过 0.6 秒未更新会变灰，过期目标和误差不再显示为实时值。
+定位无效或超过“数据过期秒数”未更新会变灰，过期目标和误差不再显示为实时值。
+该值默认为 0.6 秒，可在第三页修改；重连实时监视并重启跟随控制器后生效。
 领航车箭头使用对齐到 UWB 地图的控制航向；跟随车箭头沿用连接监视时的朝向为 +X 参考。
 重连监视时重新建立参考，领航车需静止等待对齐。
 
@@ -258,10 +262,41 @@ git commit -m "更新说明"
 git push
 ```
 
-`origin` 是本机 `.local/http/formation.git` bare 仓库。`post-update` 调用
-`git update-server-info`，Python 标准库 HTTP 服务只公开 `.local/http`。
-匿名下载地址：`http://192.168.0.117:8000/formation.git`。HTTP 不接受 push；
-发布通过主机本地文件路径完成。
+主机的 `origin` 是本机 `.local/http/formation.git` bare 仓库。
+Git Smart HTTP 服务使用 Git 自带的 `http-backend`，在同一地址提供 clone、pull 和 push：
+`http://192.168.0.117:8000/formation.git`。拉取免密码，推送用户名为 `formation`，
+专用密码在服务首次启动时生成，保存在主机 `.local/git-http-password`（权限 `0600`）。
+点击控制台底部 Git server 状态可查看、复制连接信息。
+`post-update` 继续调用 `git update-server-info`，保持旧客户端拉取兼容。
+
+**从当前电脑推送到另一台电脑的本地 Git server**：接收电脑需有当前版本软件和 Git。
+在接收电脑的仓库根目录安装服务，再打开控制台：
+
+```bash
+python3 scripts/git_http_server.py --install-service
+python3 scripts/fleet_console.py
+```
+
+若接收电脑原有服务正在运行，安装后执行 `systemctl --user restart formation-git-http.service`。
+点击**接收电脑**窗口底部状态，复制程序按本机网卡 IP 生成的推送命令，在**发送电脑**的仓库根目录执行。
+例如当前这台电脑自动检测到 `192.168.0.117`，生成的命令为：
+
+```bash
+git remote add peer http://192.168.0.117:8000/formation.git
+git -c credential.helper= push peer master:master
+```
+
+`origin` 用于当前主机发布，`peer` 用于指定的接收电脑。以后更换接收电脑，将它生成的
+`git remote add peer 地址` 改成 `git remote set-url peer 地址`；向多台电脑发布时，可分别添加命名远端。
+每台接收电脑会读取自己的 IP，并独立生成推送密码。
+这些 Git 命令适用于 Windows / macOS / Linux。推送时输入**接收电脑**的用户名 `formation` 和专用密码。
+`-c credential.helper=` 让这一次推送直接提示输入，兼容会拒绝明文 HTTP 的凭据管理器。
+HTTP 连接未加密，适用于可信局域网。
+
+推送发送已提交的 `master` 分支。若接收端有新的提交，先提交本地改动，再执行
+`git pull --rebase peer master`，解决冲突后重新 push。接收端的提交进入其 bare 仓库；
+接收电脑的开发目录也需自行 pull，小车按配置的仓库地址继续获取 `master`。
+Git 服务支持协议 v0 / v2、gzip 和分块上传，单次 HTTP 请求上限为 512 MiB。
 
 小车的 `formation-update.timer` 每分钟检查一次。检测到本机 ROS 正在运行时只 fetch；
 ROS 停止后，工作区干净且位于 `master` 时执行快进更新与构建。
@@ -375,14 +410,18 @@ bash deploy/install-robot.sh ugv1   # 按上方 IP 表选择 ugv1–ugv5
 已存在的车端配置会保留。
 
 主机 HTTP 服务是用户级 `formation-git-http.service`，由控制台启动。
-首次配置或从开机自启方式迁移时，在主机仓库根目录执行（服务文件中的工作路径需与本机一致）：
+首次配置、升级服务或移动主机仓库目录后，在仓库根目录执行：
 
 ```bash
-systemctl --user disable formation-git-http.service
-mkdir -p ~/.config/systemd/user
-cp deploy/formation-git-http.service ~/.config/systemd/user/
-systemctl --user daemon-reload
+python3 scripts/git_http_server.py --install-service
+# 已运行的服务升级后重启；首次安装则由控制台启动
+systemctl --user restart formation-git-http.service
 ```
+
+安装命令自动填入当前 Python 和仓库路径，支持不同用户名及带空格的目录，保持开机自启关闭。
+首次安装若缺少 bare 仓库，会从当前已提交代码创建 `.local/http/formation.git`。
+也可独立运行 `python3 scripts/git_http_server.py`；指定 `--repository /路径/仓库.git` 使用已有 bare 仓库。
+单独运行时可用 `--port` / `--bind` 修改监听地址，控制台内置状态检查使用本机端口 8000。
 
 运行状态也可在控制台底部查看。命令行检查与手动停止：
 
@@ -400,6 +439,7 @@ systemctl --user stop formation-git-http.service
 以下检查不启动底盘：
 
 ```bash
+python3 test/test_git_http_server.py  # 临时仓库、两个回环客户端；验证拉取、推送和认证
 source scripts/env.sh
 python test/test_fleet_launch.py
 python src/five_ugv_formation_control/scripts/formation_logger.py --self-test

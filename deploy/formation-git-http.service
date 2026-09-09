@@ -1,9 +1,9 @@
 [Unit]
-Description=Public read-only formation Git repository over HTTP
+Description=Formation Git repository over Smart HTTP
 After=network.target
 
 [Service]
-WorkingDirectory=/home/costa/Documents/formation_ws/.local/http
-ExecStart=/usr/bin/python3 -m http.server 8000 --bind 0.0.0.0
+WorkingDirectory=@WORKSPACE@
+ExecStart=@PYTHON@ @SERVER@ --port 8000 --bind 0.0.0.0
 Restart=on-failure
 RestartSec=5

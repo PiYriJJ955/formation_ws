@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from fleet_console import DEFAULTS, FleetConsole, RobotSession, load_settings
 from fleet_deploy import parse_robot_config, replace_setting, robot_number, update_identity
 from fleet_terminal import Terminal
-from fleet_workbench import FleetWorkbench, Monitor, launch_command, localization_config, saved_linear_limit, session_limits
+from fleet_workbench import (FleetWorkbench, Monitor, launch_command, localization_config,
+                             saved_data_timeout, saved_linear_limit, session_limits)
 
 DEFAULTS = dict(DEFAULTS, password="test-secret")
 
@@ -35,6 +36,15 @@ class WorkbenchChecks(unittest.TestCase):
         for value in (-1, 0.51, float('nan'), float('inf'), True, 'text'):
             with self.assertRaises(ValueError):
                 saved_linear_limit(dict(options, linear_limit=value))
+
+    def test_data_timeout_is_configurable_and_reaches_follower(self):
+        self.assertEqual(saved_data_timeout(DEFAULTS), 0.6)
+        options = dict(DEFAULTS, data_timeout='0.85')
+        self.assertIn('data_timeout:=0.85',
+                      launch_command('follower', options, '192.0.2.1', 'ugv4', '/tmp/stage'))
+        for value in (0, -1, float('nan'), float('inf'), True, 'text'):
+            with self.assertRaises((TypeError, ValueError)):
+                saved_data_timeout(dict(options, data_timeout=value))
 
     def test_uwb_cannot_share_chassis_serial_through_alias(self):
         from fleet_ros import check_serial
@@ -148,6 +158,7 @@ class WorkbenchChecks(unittest.TestCase):
                         if step in ('chassis', 'monitor'):
                             monitor.assert_called_once()
                             self.assertIn('--offsets \'{"2": [-1.2, 0.4]}\'', monitor.call_args[0][1])
+                            self.assertIn('--data-timeout 0.6', monitor.call_args[0][1])
                         else:
                             monitor.assert_not_called()
 

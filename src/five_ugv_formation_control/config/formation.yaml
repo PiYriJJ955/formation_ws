@@ -1,16 +1,19 @@
 # Controller
 control_rate: 20.0
-k_position: 0.8
-k_heading: 1.8
+k_position: 0.5
+k_lateral: 8.0  # Body-frame lateral feedback, 1/m^2.
+k_heading: 1.2
 k_heading_sync: 1.2
 max_linear: 0.15
 max_angular: 0.8
-rotate_in_place_threshold: 0.7
-velocity_deadband: 0.02
+rotate_in_place_threshold: 0.95
+rotate_exit_threshold: 0.55
+max_acceleration: 0.15  # m/s^2
+max_angular_acceleration: 0.8  # rad/s^2
+velocity_deadband: 0.02  # Smooth transition from position capture to trajectory tracking.
 
 # Position/heading coordination. Distances in m, angles in rad.
-heading_blend_distance: 0.50
-heading_blend_max: 0.35  # Must be < 0.5 to retain position correction.
+approach_distance: 0.50  # Diagnostic FOLLOWING/APPROACH boundary.
 position_tolerance: 0.10  # HOLD entry radius
 hold_exit_tolerance: 0.18
 hold_enter_duration: 0.4  # Continuous arrival + stationary confirmation, seconds
@@ -18,17 +21,19 @@ heading_tolerance: 0.0872664626  # 5 degrees
 hold_max_angular: 0.35
 
 # Input watchdog
-data_timeout: 0.5
+data_timeout: 0.6
+prediction_limit: 0.20  # Maximum constant-twist extrapolation, seconds.
+velocity_filter_tau: 0.15  # Leader velocity low-pass time constant, seconds.
 
 # UGV0 measured body velocity from nav_msgs/Odometry.twist.twist.
 # Linear velocity is rotated into uwb_map using the aligned UGV0 heading.
-leader_linear_deadband: 0.03
-leader_angular_deadband: 0.03
+leader_linear_deadband: 0.01  # Stationary detection only; exit at 1.5x.
+leader_angular_deadband: 0.01
+stationary_duration: 0.4
 
-# Yaw alignment. With auto_align_yaw=true, point every UGV toward this
-# direction in uwb_map before starting the node. Radians; 0 means UWB +X.
+# Capture each robot's odom-to-UWB heading offset while stationary, using
+# the orientation of its valid UWB pose. UWB localization must be initialized.
 auto_align_yaw: true
-initial_uwb_yaw: 0.0
 
 # Used only when auto_align_yaw=false. Radians:
 # yaw_in_uwb = yaw_from_odom_combined + yaw_offset
