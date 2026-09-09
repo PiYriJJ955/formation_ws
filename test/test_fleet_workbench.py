@@ -245,6 +245,30 @@ class WorkbenchChecks(unittest.TestCase):
             finally:
                 shutil.rmtree(terminal.directory)
 
+    def test_terminal_groups_reuse_only_matching_windows(self):
+        terminals = []
+        groups = ('chassis', 'follower', 'chassis', 'follower', 'shell', 'master')
+        with patch('fleet_terminal.shutil.which', return_value='/usr/bin/gnome-terminal'), \
+             patch.object(Terminal, '_tabs', set()), \
+             patch('fleet_terminal.subprocess.run', side_effect=[SimpleNamespace(
+                 stdout='GNOME_TERMINAL_SERVICE=:1.42\nGNOME_TERMINAL_SCREEN=/screen/%d\n' % number)
+                 for number in range(len(groups))]) as run:
+            try:
+                for group in groups:
+                    terminals.append(Terminal('192.0.2.1', DEFAULTS, '/tmp/test-known-hosts', group=group))
+                for number, parent in enumerate((None, None, '/screen/0', '/screen/1', None, None)):
+                    self.assertEqual(run.call_args_list[number][1]['env'].get('GNOME_TERMINAL_SCREEN'), parent)
+            finally:
+                for terminal in terminals:
+                    shutil.rmtree(terminal.directory)
+        workbench = FleetWorkbench.__new__(FleetWorkbench)
+        workbench.app = SimpleNamespace(config_path=Path('/tmp/settings.json'))
+        workbench.events, workbench.terminals = queue.Queue(), []
+        with patch('fleet_workbench.Terminal') as terminal:
+            for group in ('chassis', 'follower', 'master'):
+                workbench.launch(group, '192.0.2.2', 'ugv2', DEFAULTS, '/tmp/stage')
+                self.assertEqual(terminal.call_args[1]['group'], group)
+
     def test_terminal_skips_closed_tabs_and_reopens_closed_window(self):
         terminals = []
         with patch('fleet_terminal.shutil.which', return_value='/usr/bin/gnome-terminal'), \
@@ -266,6 +290,87 @@ class WorkbenchChecks(unittest.TestCase):
             finally:
                 for terminal in terminals:
                     shutil.rmtree(terminal.directory)
+
+    def test_vehicle_context_menu_and_persistent_deletion(self):
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+        except tk.TclError:
+            self.skipTest('No desktop session')
+        root.withdraw()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('fleet_console.connect_ssh', side_effect=AssertionError('Offline test')):
+            app = FleetConsole(root, Path(directory) / 'settings.json')
+            app.vars['export'].set(str(Path(directory) / 'fleet.csv'))
+            wb = app.workbench
+            first, second, third = list(app.robots)[:3]
+            try:
+                root.deiconify()
+                for index, table in enumerate((app.table, wb.vehicles)):
+                    app.notebook.select(index)
+                    table.selection_set((first, second))
+                    root.update()
+                    with patch.object(app.vehicle_menu, 'tk_popup') as popup, \
+                         patch.object(app.vehicle_menu, 'grab_release'), \
+                         patch.object(wb, 'open_ssh') as open_ssh:
+                        _, y, _, height = table.bbox(second)
+                        table.event_generate('<Button-3>', x=10, y=y + height // 2)
+                        self.assertEqual(table.selection(), (first, second))
+                        popup.assert_called_once()
+                        app.vehicle_menu.invoke(0)
+                        open_ssh.assert_called_once_with([first, second])
+                        _, y, _, height = table.bbox(third)
+                        table.event_generate('<Button-3>', x=10, y=y + height // 2)
+                        self.assertEqual(table.selection(), (third,))
+                        popup.reset_mock()
+                        table.event_generate('<Button-3>', x=10, y=0)
+                        popup.assert_not_called()
+                session = RobotSession(first, None, DEFAULTS, app.events)
+                app.sessions[first] = session
+                app.table.selection_set(first)
+                app.selection_changed()
+                wb.active_identities = {first: 1}
+                old_scan = app.scan_cancel
+                wb.vehicles.selection_set((first, second))
+                with patch.object(wb, 'stop') as stop, patch('fleet_workbench.Terminal') as terminal:
+                    wb.terminals = [('shell', first, terminal), ('shell', third, terminal.return_value)]
+                    _, y, _, height = wb.vehicles.bbox(first)
+                    with patch.object(app.vehicle_menu, 'tk_popup'), patch.object(app.vehicle_menu, 'grab_release'):
+                        wb.vehicles.event_generate('<Button-3>', x=10, y=y + height // 2)
+                    app.vehicle_menu.invoke(1)
+                    stop.assert_called_once()
+                    terminal.stop.assert_called_once()
+                    terminal.return_value.stop.assert_not_called()
+                    wb.terminals.clear()
+                self.assertTrue(old_scan.is_set())
+                self.assertTrue(session.closed.is_set())
+                self.assertEqual(session.command[:2], (0, 0))
+                self.assertNotIn(first, app.sessions)
+                self.assertEqual(app.selected_ip, '')
+                for ip in (first, second):
+                    self.assertNotIn(ip, app.robots)
+                    self.assertFalse(app.table.exists(ip))
+                    self.assertFalse(wb.vehicles.exists(ip))
+                restored, robots = load_settings(app.config_path)
+                self.assertEqual(set(robots), set(app.robots))
+                self.assertEqual(restored['formation_selected'], '')
+                self.assertNotIn(first, Path(app.vars['export'].get()).read_text())
+                late = RobotSession(first, None, DEFAULTS, app.events)
+                app.events.put(('connected', late, {'cancelled': old_scan}))
+                app.events.put(('auth_failed', first, {'error': 'late reply', 'cancelled': old_scan}))
+                app.events.put(('status', session, {'robot_id': 'ugv1'}))
+                wb.events.put(('config', first, {'robot_id': 'ugv1'}))
+                app.poll()
+                self.assertTrue(late.closed.is_set())
+                self.assertNotIn(first, app.robots)
+                with patch.object(app, 'robot_id_for') as identity:
+                    app.selected_action('identity', addresses=[first])
+                    identity.assert_not_called()
+            finally:
+                app.closing = True
+                for timer in root.tk.splitlist(root.tk.call('after', 'info')):
+                    root.after_cancel(timer)
+                root.destroy()
 
     def test_leader_keyboard_events_and_stop_conditions(self):
         import tkinter as tk

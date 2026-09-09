@@ -331,6 +331,9 @@ class FleetWorkbench:
         self.app.vars['formation_selected'].set(','.join(self.vehicles.selection()))
 
     def refresh_vehicles(self):
+        for ip in self.vehicles.get_children():
+            if ip not in self.app.robots:
+                self.vehicles.delete(ip)
         for ip, row in self.app.robots.items():
             name = row.get('pending_id') or row.get('robot_id') or row.get('name', '')
             terminal_states = [terminal.status()['state'] for _, host, terminal in self.terminals if host == ip]
@@ -494,7 +497,9 @@ class FleetWorkbench:
                 self.events.put(('log', '%s %s：终端已存在，检查就绪状态' % (name, step)))
                 return terminal
         terminal = Terminal(ip, options, self.app.config_path.with_name('known_hosts'),
-                            launch_command(step, options, ip, name, remote), '%s · %s · %s' % (name, ip, step))
+                            launch_command(step, options, ip, name, remote),
+                            '%s · %s · %s' % ({'master': 'ROS Master', 'chassis': '底盘与定位',
+                                              'follower': '跟随控制器'}[step], name, ip), group=step)
         self.terminals.append((step, ip, terminal))
         self.events.put(('log', '%s %s：已打开 SSH 启动终端' % (name, step)))
         return terminal
@@ -581,6 +586,8 @@ class FleetWorkbench:
                     self.events.put(('state', ip, results[ip]))
             if step in ('all', 'monitor', 'chassis'):
                 current = master
+                if self.cancel.is_set():
+                    raise RuntimeError('启动已取消')
                 if self.monitor:
                     self.monitor.stop.set()
                     self.monitor.thread.join(4)
@@ -1254,6 +1261,8 @@ class FleetWorkbench:
                 self.append_log(event[1] + ' ' + event[2])
             elif kind == 'config':
                 ip, config = event[1:]
+                if ip not in self.app.robots:
+                    continue
                 self.app.robots[ip].update(config, name=config['robot_id'], ssh='已连接（启动会话）')
                 if self.app.robots[ip].get('pending_id') == config['robot_id']:
                     self.app.robots[ip].pop('pending_id', None)

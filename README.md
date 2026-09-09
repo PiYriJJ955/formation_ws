@@ -111,6 +111,9 @@ python3 test/test_fleet_console.py
 上方三个页签是“扫描与连接 / 编队算法 / 小车定位图”。第二页的车辆选择与第一页面
 独立记住，Ctrl / Shift 多选参与车辆。列表同时显示 UGV 名称、IP、`UGV_ID`、SSH 和启动状态。
 双击车辆行或点击“打开选中 SSH 终端”可直接登录，在终端输入其他命令。
+两页的车辆列表均支持右键“打开 SSH 终端”和“删除选中车辆”；右键已选行保留多选，
+右键其他行则选中该行。删除会移除本地记录、断开对应连接并关闭对应终端；涉及本次编队时先停止编队。
+两页列表和保存的记录同步更新，重新扫描可再次发现车辆。
 
 “所有小车串口权限（777）”按钮作用于列表中所有已登记车辆，无需多选。
 程序自动 SSH 登录，使用第一页保存的密码完成 sudo，执行
@@ -141,7 +144,8 @@ python3 test/test_fleet_console.py
 首次使用或修改车端配置后，先运行“检查并同步配置”；该步骤完成配置同步和启动文件上传。
 单独启动 Master、底盘、跟随或监视时直接使用已有配置，保留对应的 ROS 就绪检查。
 单独连接监视只登录 Master，编队偏移使用界面最近一次读取的车端值。
-`roscore`、`roslaunch` 和手动 SSH 会话通过 GNOME Terminal 标签页打开，控制台后续会话复用同一终端窗口，
+GNOME Terminal 按任务分窗口：各车底盘与定位合并在一个窗口，各车跟随控制器合并在另一个窗口；
+ROS Master 和手动 SSH 各自使用独立的窗口。同类任务以标签页区分车辆，并复用对应窗口，
 窗口关闭后自动新建。标签标题显示车辆、IP 和任务；Ctrl+C 停止当前命令后会进入
 可输入命令的 SSH shell。启动日志区域可以折叠，终端窗口也可统一最小化。
 已有 Master 会直接接入；重复串口占用或已有同名控制器会报错，便于先结束原来的启动任务。
@@ -212,7 +216,7 @@ GUI 和 ROS 通信的离线检查命令：
 python3 test/test_fleet_console.py
 python3 test/test_fleet_workbench.py
 python3 test/test_leader_tracker.py  # 直线、折线转弯、限速和暂停恢复模拟
-python3 test/test_fleet_terminal.py  # 回环 SSH 测试，在同一窗口短暂打开两个测试标签页
+python3 test/test_fleet_terminal.py  # 回环 SSH 测试，底盘 / 跟随两个窗口各打开两个测试标签页
 source scripts/env.sh
 python3 test/test_fleet_launch.py
 python3 test/test_fleet_ros.py   # 仅启动回环地址 ROS Master 和模拟发布器，不启动底盘

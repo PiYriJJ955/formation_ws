@@ -133,7 +133,7 @@ def load_settings(path):
         with open(path, encoding='utf-8') as stream:
             data = json.load(stream)
         options.update(data['options'])
-        robots.update(data['robots'])
+        robots = data['robots']
     for ip in BLOCKED_IPS:
         robots.pop(ip, None)
     for key in ('selected', 'formation_selected'):
@@ -541,6 +541,9 @@ class FleetConsole:
         root.protocol('WM_DELETE_WINDOW', self.close)
         from fleet_workbench import FleetWorkbench
         self.workbench = FleetWorkbench(self)
+        self.vehicle_menu = tk.Menu(root, tearoff=False)
+        for table in (self.table, self.workbench.vehicles):
+            table.bind('<Button-3>', self.show_vehicle_menu)
         self.notebook.select(max(0, min(2, int(self.vars['active_tab'].get()))))
         def tab_changed(_):
             self.stop_motion()
@@ -584,6 +587,57 @@ class FleetConsole:
             self.table.item(ip, values=values)
         else:
             self.table.insert('', 'end', iid=ip, values=values)
+
+    def show_vehicle_menu(self, event):
+        table = event.widget
+        ip = table.identify_row(event.y)
+        if not ip:
+            return 'break'
+        if ip not in table.selection():
+            table.selection_set(ip)
+        table.focus(ip)
+        addresses = list(table.selection())
+        self.vehicle_menu.delete(0, 'end')
+        self.vehicle_menu.add_command(label='打开 SSH 终端', command=lambda: self.workbench.open_ssh(addresses))
+        self.vehicle_menu.add_command(label='删除选中车辆', command=lambda: self.delete_vehicles(addresses))
+        try:
+            self.vehicle_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.vehicle_menu.grab_release()
+        return 'break'
+
+    def delete_vehicles(self, addresses):
+        addresses = set(addresses) & self.robots.keys()
+        if not addresses:
+            return
+        self.cancel_scan()
+        self.stop_motion()
+        workbench = self.workbench
+        active_ips = set(workbench.active_identities)
+        if workbench.signature:
+            active_ips.update(row[0] for row in workbench.signature[4])
+            active_ips.add(workbench.signature[0])
+        if addresses & active_ips:
+            workbench.stop()
+        for _, ip, terminal in list(workbench.terminals):
+            if ip in addresses:
+                terminal.stop()
+        for ip in addresses:
+            session = self.sessions.pop(ip, None)
+            if session:
+                session.close()
+            self.robots.pop(ip)
+            workbench.robot_states.pop(ip, None)
+            if self.table.exists(ip):
+                self.table.delete(ip)
+        self.selection_changed()
+        workbench.refresh_vehicles()
+        workbench.remember_selection()
+        self.save()
+        self.write_export()
+        message = '已删除 %d 辆车的本地记录并断开连接；重新扫描可再次发现。' % len(addresses)
+        self.status.set(message)
+        workbench.status.set(message)
 
     def selection_changed(self, _=None):
         selection = self.table.selection()
@@ -752,7 +806,7 @@ class FleetConsole:
                 with socket.create_connection((ip, int(options['port'])), float(options['timeout'])):
                     pass
             except OSError as error:
-                self.events.put(('unreachable', ip, {'error': str(error)}))
+                self.events.put(('unreachable', ip, {'error': str(error), 'cancelled': cancelled}))
                 return
             if cancelled.is_set():
                 return
@@ -764,7 +818,7 @@ class FleetConsole:
                 else:
                     self.events.put(('connected', session, {'cancelled': cancelled}))
             except Exception as error:
-                self.events.put(('auth_failed', ip, {'error': str(error)}))
+                self.events.put(('auth_failed', ip, {'error': str(error), 'cancelled': cancelled}))
         with ThreadPoolExecutor(max_workers=int(options['workers'])) as pool:
             futures = [pool.submit(probe, ip) for ip in addresses]
             for count, future in enumerate(as_completed(futures), 1):
@@ -805,7 +859,7 @@ class FleetConsole:
         return row['robot_id']
 
     def selected_action(self, action, addresses=None, popup=True, launch=None):
-        addresses = list(self.table.selection() if addresses is None else addresses)
+        addresses = [ip for ip in (self.table.selection() if addresses is None else addresses) if ip in self.robots]
         if not addresses:
             self.status.set('请先选择要更新的 IP；Ctrl / Shift 可多选')
             return
@@ -895,6 +949,8 @@ class FleetConsole:
                 self.refresh_row(ip)
                 source.start(launch=source.options['auto_start'] and not self.workbench.active())
             elif event in ('unreachable', 'auth_failed'):
+                if data.get('cancelled') is not None and data['cancelled'].is_set():
+                    continue
                 ip = source
                 if event == 'auth_failed':
                     self.robots.setdefault(ip, {'name': '', 'remark': ''})

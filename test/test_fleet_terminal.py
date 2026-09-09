@@ -80,33 +80,37 @@ def main():
         finally:
             if ssh:
                 ssh.close()
-    threads = [threading.Thread(target=serve, daemon=True) for _ in range(2)]
+    groups = ('chassis', 'follower', 'chassis', 'follower')
+    threads = [threading.Thread(target=serve, daemon=True) for _ in groups]
     for thread in threads:
         thread.start()
     terminals = []
     with tempfile.TemporaryDirectory() as directory:
         try:
             options = dict(DEFAULTS, username='offline-test', password='test-token', port=str(server.getsockname()[1]))
-            for number in range(2):
+            for number, group in enumerate(groups):
                 terminals.append(Terminal('127.0.0.1', options, Path(directory) / ('known_hosts_%d' % number),
-                                          'printf offline-test', 'Formation offline terminal check %d' % number))
+                                          'printf offline-test', 'Formation offline terminal check %s %d' % (group, number),
+                                          group=group))
             deadline = time.monotonic() + 12
             while any(terminal.status()['state'] != '运行中' for terminal in terminals):
                 if time.monotonic() > deadline:
                     raise AssertionError([terminal.status() for terminal in terminals])
                 time.sleep(0.05)
-            assert len(executed) == 2 and all('printf offline-test' in command for command in executed), executed
+            assert len(executed) == len(groups) and all('printf offline-test' in command for command in executed), executed
             for terminal in terminals:
                 assert not (terminal.directory / 'request.json').exists(), 'Credentials must be consumed'
             if os.environ.get('DISPLAY') and shutil.which('xwininfo'):
                 windows = subprocess.check_output(['xwininfo', '-root', '-tree'], universal_newlines=True)
                 windows = [line for line in windows.splitlines() if 'Formation offline terminal check' in line]
-                assert len(windows) == 1, windows
+                assert len(windows) == 2, windows
+                for group in set(groups):
+                    assert sum(group in line for line in windows) == 1, windows
             finish_command.set()
             deadline = time.monotonic() + 5
-            while len(shells) < 2 and time.monotonic() < deadline:
+            while len(shells) < len(groups) and time.monotonic() < deadline:
                 time.sleep(0.05)
-            assert len(shells) == 2, 'Finished commands must leave interactive SSH shells'
+            assert len(shells) == len(groups), 'Finished commands must leave interactive SSH shells'
             for terminal in terminals:
                 terminal.stop()
             deadline = time.monotonic() + 5
@@ -115,7 +119,7 @@ def main():
                     break
                 time.sleep(0.1)
             assert all(terminal.status()['state'] == '已关闭' for terminal in terminals), [t.status() for t in terminals]
-            print('Native GNOME terminal passed: two SSH tabs in one window, visible exec, interactive shells, stop and credential-file removal.')
+            print('Native GNOME terminal passed: chassis and follower windows with two tabs each, visible exec, interactive shells, stop and credential-file removal.')
         finally:
             finish_command.set()
             for terminal in terminals:

@@ -29,12 +29,13 @@ class Terminal:
     _tabs = weakref.WeakSet()
     _lock = threading.Lock()
 
-    def __init__(self, ip, options, host_keys, command='', title='SSH'):
+    def __init__(self, ip, options, host_keys, command='', title='SSH', group='shell'):
         executable = shutil.which('gnome-terminal')
         if not executable:
             raise RuntimeError('需要 gnome-terminal：sudo apt install gnome-terminal')
         self.directory = Path(tempfile.mkdtemp(prefix='formation-terminal-'))
         self.ip, self.title, self.started = ip, title, time.monotonic()
+        self.group = group
         request = self.directory / 'request.json'
         write_json(request, dict(ip=ip, options=options, host_keys=str(host_keys), command=command))
         try:
@@ -44,6 +45,8 @@ class Terminal:
                 for key in ('GNOME_TERMINAL_SERVICE', 'GNOME_TERMINAL_SCREEN'):
                     environment.pop(key, None)
                 for terminal in list(self._tabs):
+                    if terminal.group != self.group:
+                        continue
                     status = terminal.status()
                     if 'pid' in status:
                         try:
