@@ -15,17 +15,31 @@
 原 `192.168.0.111`、`192.168.0.112` 两车已弃用，默认排除扫描。
 源码完整保存在新工作空间，构建只依赖 `/opt/ros`，旧工作空间保留。
 
+ugv2–ugv4 新增 IOT 的 UID、固定串口、测距/测角实测结果和编队采集命令见
+[UWB IOT 设备与实测记录](docs/uwb-iot.md)，其中也记录了当前定位串口配置需要修正的位置。
+
 ## 小车编队控制台 GUI
 
-主机桌面运行 Python 3 程序，五车统一使用 `mini_4wd`：
+主机桌面运行 Python 3.6+ 程序，五车统一使用 `mini_4wd`。
+在仓库根目录安装 GUI 依赖（Ubuntu 18.04 默认 Python 3.6 使用 pip 21.x）：
+
+```bash
+sudo apt update
+sudo apt install -y python3-pip python3-tk gnome-terminal
+python3 -m pip install --user --upgrade 'pip<22'
+python3 -m pip install --user -r requirements.txt
+```
+
+然后检查桌面环境并启动：
 
 ```bash
 python3 scripts/fleet_console.py --check-gui
 python3 scripts/fleet_console.py
 ```
 
-本机已验证 X11、Tk 8.6 与 Paramiko 可用。其他 Linux 主机需要
-`python3-tk`、`python3-paramiko`、`python3-yaml`、`gnome-terminal`；主机控制界面不依赖本机 ROS。
+本机 Ubuntu 20.04 已验证 X11、Tk 8.6 与 Paramiko 可用；Ubuntu 18.04 尚未完整实测。
+`requirements.txt` 包含 Paramiko 和 PyYAML；Tk 与 GNOME Terminal 通过系统包安装。
+主机控制界面不依赖本机 ROS。
 车端需要已经编译的工作空间、ROS 环境和可读写的 `/dev/wheeltec_controller`。
 
 1. 填写扫描范围和排除列表，支持 `192.168.0.1-254`、完整起止 IP、

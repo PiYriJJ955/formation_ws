@@ -52,7 +52,10 @@ class Terminal:
         except (OSError, ValueError):
             code = self.process.poll()
             if code not in (None, 0) or time.monotonic() - self.started > 15:
-                (self.directory / 'request.json').unlink(missing_ok=True)
+                try:
+                    (self.directory / 'request.json').unlink()
+                except FileNotFoundError:
+                    pass
                 return {'state': '失败', 'error': '终端未启动，请检查桌面会话'}
             return {'state': '打开终端中'}
 

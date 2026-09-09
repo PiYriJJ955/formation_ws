@@ -1,0 +1,4 @@
+# Host GUI dependencies (Python 3.6+).
+# Install Tk and GNOME Terminal with apt; see README.md.
+paramiko>=2.4
+PyYAML>=5.1

@@ -1,0 +1,11 @@
+# USB adapter serials verified on 2026-09-09. UID mapping: docs/uwb-iot.md.
+# ugv2
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", ATTRS{serial}=="585A043472", SYMLINK+="uwb_iot", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", ATTRS{serial}=="5959047708", SYMLINK+="uwb_linktrack", GROUP="dialout", MODE="0660"
+# ugv3
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", ATTRS{serial}=="5959047028", SYMLINK+="uwb_iot", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", ATTRS{serial}=="5959049274", SYMLINK+="uwb_iot_aux", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", ATTRS{serial}=="5B7A090917", SYMLINK+="uwb_linktrack", GROUP="dialout", MODE="0660"
+# ugv4
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", ATTRS{serial}=="5577010998", SYMLINK+="uwb_iot", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", ATTRS{serial}=="5B7A129523", SYMLINK+="uwb_linktrack", GROUP="dialout", MODE="0660"
