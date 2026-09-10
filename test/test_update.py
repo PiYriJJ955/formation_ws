@@ -9,9 +9,9 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(*args, cwd, ok=True):
+def run(*args, cwd, ok=True, env=None):
     result = subprocess.run(args, cwd=str(cwd), text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
     if ok:
         assert result.returncode == 0, result.stdout
     return result
@@ -44,7 +44,12 @@ with tempfile.TemporaryDirectory(prefix='formation-update-') as directory:
     (robot / 'version').write_text('local edit\n')
     assert run('bash', 'scripts/update.sh', cwd=robot, ok=False).returncode != 0
     assert (robot / 'version').read_text() == 'local edit\n'
-    result = run('bash', 'scripts/update.sh', '--discard-local-changes', cwd=robot)
+    # Bootstrap must use the host's updater even when the vehicle's copy cannot upgrade itself.
+    (robot / 'scripts/update.sh').write_text('#!/bin/bash\necho "Old updater cannot discard edits"\nexit 1\n')
+    updater = root / 'uploaded-update.sh'
+    shutil.copyfile(str(ROOT / 'scripts/update.sh'), str(updater))
+    result = run('bash', str(updater), '--discard-local-changes', cwd=root,
+                 env=dict(os.environ, FORMATION_UPDATE_WORKSPACE=str(robot)))
     assert 'Workspace ready' in result.stdout, result.stdout
     assert (robot / 'version').read_text() == 'two\n'
     revision = run('git', 'rev-parse', 'HEAD', cwd=robot).stdout.strip()
@@ -68,7 +73,9 @@ with tempfile.TemporaryDirectory(prefix='formation-update-') as directory:
     assert (robot / '.local/built-revision').read_text().strip() == revision
 
     run('git', 'checkout', '-qb', 'local-work', cwd=robot)
-    assert run('bash', 'scripts/update.sh', cwd=robot, ok=False).returncode != 0
+    (robot / 'version').write_text('branch edit\n')
+    assert run('bash', 'scripts/update.sh', '--discard-local-changes', cwd=robot, ok=False).returncode != 0
+    assert (robot / 'version').read_text() == 'branch edit\n'
     assert run('git', 'branch', '--show-current', cwd=robot).stdout.strip() == 'local-work'
     run('git', 'checkout', '-q', 'master', cwd=robot)
     run('git', 'config', 'user.name', 'Test', cwd=robot)

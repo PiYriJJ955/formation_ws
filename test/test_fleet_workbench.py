@@ -249,6 +249,42 @@ class WorkbenchChecks(unittest.TestCase):
                 localization_config(json.dumps(value))
         self.assertEqual(localization_config()['anchors'][2]['x'], 6.4)
 
+    def test_anchor_edits_survive_profile_switch_and_settings_reload(self):
+        import tkinter as tk
+        from fleet_console import save_settings
+        interpreter = tk.Tcl()
+        workbench = FleetWorkbench.__new__(FleetWorkbench)
+        workbench.app = SimpleNamespace(vars={key: tk.StringVar(interpreter, value=value)
+                                             for key, value in DEFAULTS.items()}, save=lambda: None)
+        workbench.selected_anchor_profile = 'outdoor'
+        workbench.clear_trails = lambda: None
+        workbench.map_status = tk.StringVar(interpreter)
+        variables = workbench.app.vars
+        base = localization_config()
+        outdoor = json.dumps(dict(anchors=base['anchors'], tag_height=0.31))
+        indoor = json.dumps(dict(anchors=base['anchors'], tag_height=0.42))
+        variables['anchors_json'].set(outdoor)  # Existing settings have no per-profile history.
+        variables['anchor_profile'].set('indoor')
+        workbench.select_anchor_profile()
+        self.assertEqual(variables['anchors_json'].get(), '')
+        variables['anchors_json'].set(indoor)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'settings.json'
+            save_settings(path, {key: value.get() for key, value in variables.items()}, {})
+            saved, _ = load_settings(path)
+        for key in ('anchors_json', 'anchor_overrides_json', 'anchor_profile'):
+            variables[key].set(saved[key])
+        variables['anchor_profile'].set('outdoor')
+        workbench.select_anchor_profile()
+        self.assertEqual(variables['anchors_json'].get(), outdoor)
+        variables['anchors_json'].set('')  # Reset applies only to the selected profile.
+        variables['anchor_profile'].set('indoor')
+        workbench.select_anchor_profile()
+        self.assertEqual(variables['anchors_json'].get(), indoor)
+        variables['anchor_profile'].set('outdoor')
+        workbench.select_anchor_profile()
+        self.assertEqual(variables['anchors_json'].get(), '')
+
     def test_launch_sources_correct_environment_and_no_follower_on_leader(self):
         for step in ('master', 'chassis', 'follower'):
             command = launch_command(step, dict(DEFAULTS, workspace='~/workspace with space'), '192.0.2.1', 'ugv2', '/tmp/a b')

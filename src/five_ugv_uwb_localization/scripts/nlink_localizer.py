@@ -4,6 +4,7 @@
 from __future__ import print_function
 
 import math
+import threading
 
 import rospy
 from geometry_msgs.msg import PoseStamped
@@ -18,13 +19,14 @@ class NLinkLocalizer(object):
             raise ValueError('~timeout must be positive')
         self.world_frame = rospy.get_param('~world_frame', 'linktrack_map')
         self.last = None
+        self.lock = threading.Lock()
         self.pose_pub = rospy.Publisher('uwb/pose', PoseStamped, queue_size=1)
         self.valid_pub = rospy.Publisher('uwb/valid', Bool, queue_size=1, latch=True)
         self.status_pub = rospy.Publisher('uwb/status', String, queue_size=1, latch=True)
         topic = rospy.get_param('~input_topic', 'nlink_linktrack_nodeframe2')
-        rospy.Subscriber(topic, LinktrackNodeframe2, self.update, queue_size=1)
         self.valid_pub.publish(Bool(data=False))
         self.status_pub.publish(String(data='WAIT_LINKTRACK'))
+        rospy.Subscriber(topic, LinktrackNodeframe2, self.update, queue_size=1)
         rospy.Timer(rospy.Duration(0.05), self.watchdog)
 
     @staticmethod
@@ -37,6 +39,10 @@ class NLinkLocalizer(object):
         return all(NLinkLocalizer.is_finite(value) for value in values)
 
     def update(self, message):
+        with self.lock:
+            self.publish_pose(message)
+
+    def publish_pose(self, message):
         position = message.pos_3d
         quaternion = message.quaternion
         norm = sum(float(value) * float(value) for value in quaternion)
@@ -48,18 +54,20 @@ class NLinkLocalizer(object):
         pose.header.stamp = rospy.Time.now()
         pose.header.frame_id = self.world_frame
         pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = map(float, position)
-        pose.pose.orientation.w, pose.pose.orientation.x = float(quaternion[0]), float(quaternion[1])
-        pose.pose.orientation.y, pose.pose.orientation.z = float(quaternion[2]), float(quaternion[3])
+        scale = math.sqrt(norm)
+        pose.pose.orientation.w, pose.pose.orientation.x = float(quaternion[0]) / scale, float(quaternion[1]) / scale
+        pose.pose.orientation.y, pose.pose.orientation.z = float(quaternion[2]) / scale, float(quaternion[3]) / scale
         self.pose_pub.publish(pose)
         self.last = pose.header.stamp
         self.valid_pub.publish(Bool(data=True))
         self.status_pub.publish(String(data='LINKTRACK'))
 
     def watchdog(self, _event):
-        valid = self.last is not None and (rospy.Time.now() - self.last).to_sec() <= self.timeout
-        if not valid:
-            self.valid_pub.publish(Bool(data=False))
-            self.status_pub.publish(String(data='LINKTRACK_TIMEOUT'))
+        with self.lock:
+            valid = self.last is not None and 0 <= (rospy.Time.now() - self.last).to_sec() <= self.timeout
+            if not valid:
+                self.valid_pub.publish(Bool(data=False))
+                self.status_pub.publish(String(data='LINKTRACK_TIMEOUT'))
 
 
 if __name__ == '__main__':

@@ -77,21 +77,25 @@ def sync_workspace(client, options, ip, robot_id, cancelled, progress=None):
     ipaddress.IPv4Address(ip)
     ipaddress.IPv4Address(options['master_ip'])
     remote = '/tmp/formation-install-%s.sh' % uuid.uuid4().hex
+    updater = remote + '.update.sh'
     try:
         with client.open_sftp() as sftp:
             sftp.put(str(Path(__file__).resolve().parents[1] / 'deploy/install-robot.sh'), remote)
             sftp.chmod(remote, 0o600)
+            sftp.put(str(Path(__file__).with_name('update.sh')), updater)
+            sftp.chmod(updater, 0o600)
         command = ' '.join(['bash', shlex.quote(remote), shlex.quote(robot_id),
                             shell_path(options['workspace']), shlex.quote(options['repository']),
-                            shlex.quote(ip), shlex.quote(options['master_ip'])])
+                            shlex.quote(ip), shlex.quote(options['master_ip']), shlex.quote(updater)])
         run_remote(client, command, cancelled, progress=progress)
         return read_robot_config(client)
     finally:
-        try:
-            with client.open_sftp() as sftp:
-                sftp.remove(remote)
-        except Exception:
-            pass
+        for path in (remote, updater):
+            try:
+                with client.open_sftp() as sftp:
+                    sftp.remove(path)
+            except Exception:
+                pass
 
 
 def parse_robot_config(text):

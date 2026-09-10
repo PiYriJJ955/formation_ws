@@ -58,7 +58,8 @@ def watch_git_server(events, stopped):
     startup_error = ''
     try:
         result = subprocess.run(command + ['start', service], stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, universal_newlines=True, timeout=15)
+                                stderr=subprocess.PIPE, universal_newlines=True, timeout=15,
+                                env=dict(os.environ, LC_ALL='C'))
         missing = result.returncode and service in result.stderr and (
             'not found' in result.stderr.lower() or 'could not be found' in result.stderr.lower())
         if missing:

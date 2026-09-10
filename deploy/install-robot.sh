@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-[[ "${1:-}" =~ ^ugv(0|[1-9][0-9]*)$ ]] || { echo 'Usage: install-robot.sh ugvN [workspace [repository [robot_ip [master_ip]]]]' >&2; exit 1; }
+[[ "${1:-}" =~ ^ugv(0|[1-9][0-9]*)$ ]] || { echo 'Usage: install-robot.sh ugvN [workspace [repository [robot_ip [master_ip [updater]]]]]' >&2; exit 1; }
 robot_id=${1#ugv}
 workspace=${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 repository=${3:-http://192.168.0.117:8000/formation.git}
@@ -36,7 +36,8 @@ git remote set-url origin "$repository"
 git config pull.ff only
 # This LAN URL must bypass any shell-level HTTP proxy.
 git config http.proxy ''
-bash scripts/update.sh --discard-local-changes
+# GUI uploads the current updater, since an older checkout cannot discard edits yet.
+FORMATION_UPDATE_WORKSPACE="$workspace" bash "${6:-scripts/update.sh}" --discard-local-changes
 revision=$(git rev-parse HEAD)
 if [[ ! -f devel/setup.bash || ! -f .local/built-revision ]] || \
    [[ "$(<.local/built-revision)" != "$revision" || "$(git rev-parse origin/master)" != "$revision" ]]; then

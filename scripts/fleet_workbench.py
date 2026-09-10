@@ -29,6 +29,7 @@ DEFAULTS = {
     'leader': 'ugv1', 'formation_selected': '192.168.0.106,192.168.0.108,192.168.0.109,192.168.0.110,192.168.0.114',
     'localization_mode': 'five_ugv', 'anchor_profile': 'outdoor',
     'anchors_json': '',
+    'anchor_overrides_json': '{}',
     'linear_limit': '',
     'leader_control_mode': 'keyboard', 'leader_path': '2.0, 2.2\n3.0, 2.2\n3.0, 2.8',
     'leader_path_bends': '[]',
@@ -253,6 +254,7 @@ class Monitor:
 class FleetWorkbench:
     def __init__(self, app):
         self.app, self.root, self.tk, self.ttk = app, app.root, app.tk, app.ttk
+        self.selected_anchor_profile = app.vars['anchor_profile'].get()
         self.events = queue.Queue()
         self.cancel = threading.Event()
         self.worker = None
@@ -1363,7 +1365,11 @@ class FleetWorkbench:
         self.ttk.Button(bottom, text='恢复所选档案默认值', command=lambda: save(True)).pack(side='left')
 
     def select_anchor_profile(self, _=None):
-        self.app.vars['anchors_json'].set('')
+        overrides = json.loads(self.app.vars['anchor_overrides_json'].get())
+        overrides[self.selected_anchor_profile] = self.app.vars['anchors_json'].get()
+        self.selected_anchor_profile = self.app.vars['anchor_profile'].get()
+        self.app.vars['anchors_json'].set(overrides.get(self.selected_anchor_profile, ''))
+        self.app.vars['anchor_overrides_json'].set(json.dumps(overrides))
         self.clear_trails()
         self.map_status.set('已切换到%s；下次启动定位时生效。' %
                             ANCHOR_PROFILES.get(self.app.vars['anchor_profile'].get(), '选定'))
