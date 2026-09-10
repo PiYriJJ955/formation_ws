@@ -85,6 +85,8 @@ def main():
     parser.add_argument('--leader', type=int, default=0)
     parser.add_argument('--step', choices=['chassis', 'follower'], default='chassis')
     parser.add_argument('--localization-mode', choices=['five_ugv', 'linktrack'], default='five_ugv')
+    parser.add_argument('--formation-algorithm', choices=['five_ugv_formation_control',
+                        'five_ugv_mpc_formation_control'], default='five_ugv_formation_control')
     parser.add_argument('--linear-limits', default='')
     parser.add_argument('--offsets', default='{}')
     parser.add_argument('--bounds', default='')
@@ -97,6 +99,12 @@ def main():
     if args.mode == 'check':
         if args.step == 'chassis':
             check_serial()
+        if args.step == 'follower':
+            import rospkg
+            rospkg.RosPack().get_path(args.formation_algorithm)
+            if args.formation_algorithm == 'five_ugv_mpc_formation_control':
+                from five_ugv_mpc_formation_control.mpc import MPCSolver
+                MPCSolver()  # Verify the installed Python/SciPy runtime before launch.
         result = master_proxy().getSystemState('/formation_console_probe')
         if result[0] != 1:
             raise RuntimeError('Cannot read ROS Master state')

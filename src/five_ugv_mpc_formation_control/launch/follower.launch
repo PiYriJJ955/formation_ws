@@ -1,0 +1,77 @@
+<launch>
+  <arg name="mpc_config" default="$(find five_ugv_mpc_formation_control)/config/mpc.yaml"/>
+  <arg name="ugv_id" default="$(optenv UGV_ID 1)"/>
+  <arg name="leader_id" default="0"/>
+  <arg name="offset_x" default="$(optenv UGV_OFFSET_X -0.8)"/>
+  <arg name="offset_y" default="$(optenv UGV_OFFSET_Y 0.8)"/>
+  <arg name="offset_yaw" default="0.0"/>
+  <arg name="max_linear" default="0.15"/>
+  <arg name="data_timeout" default="0.6"/>
+  <arg name="auto_enable" default="false"/>
+  <arg name="enable_logger" default="true"/>
+  <arg name="log_root" default="$(optenv FORMATION_WS /home/wheeltec/formation_ws)/logs/formation"/>
+
+  <arg name="leader_pose_topic" default="/ugv$(arg leader_id)/uwb/pose"/>
+  <arg name="leader_valid_topic" default="/ugv$(arg leader_id)/uwb/valid"/>
+  <arg name="leader_odom_topic" default="/ugv$(arg leader_id)/odom_combined"/>
+  <arg name="leader_velocity_odom_topic" default="/ugv$(arg leader_id)/odom"/>
+  <arg name="self_pose_topic" default="/ugv$(arg ugv_id)/uwb/pose"/>
+  <arg name="self_valid_topic" default="/ugv$(arg ugv_id)/uwb/valid"/>
+  <arg name="self_odom_topic" default="/ugv$(arg ugv_id)/odom_combined"/>
+  <arg name="self_velocity_odom_topic" default="/ugv$(arg ugv_id)/odom"/>
+  <arg name="leader_cmd_vel_topic" default="/ugv$(arg leader_id)/cmd_vel"/>
+  <arg name="cmd_vel_topic" default="/ugv$(arg ugv_id)/cmd_vel"/>
+
+  <group ns="ugv$(arg ugv_id)">
+    <node pkg="five_ugv_mpc_formation_control"
+          type="mpc_follower.py"
+          name="formation_controller"
+          output="screen">
+      <rosparam command="load"
+                file="$(find five_ugv_formation_control)/config/formation.yaml"/>
+      <rosparam command="load" file="$(arg mpc_config)"/>
+      <param name="robot_name" value="ugv$(arg ugv_id)"/>
+      <param name="offset_x" value="$(arg offset_x)"/>
+      <param name="offset_y" value="$(arg offset_y)"/>
+      <param name="offset_yaw" value="$(arg offset_yaw)"/>
+      <param name="max_linear" value="$(arg max_linear)"/>
+      <param name="data_timeout" value="$(arg data_timeout)"/>
+      <param name="enabled" value="$(arg auto_enable)"/>
+      <param name="leader_pose_topic" value="$(arg leader_pose_topic)"/>
+      <param name="leader_valid_topic" value="$(arg leader_valid_topic)"/>
+      <param name="leader_odom_topic" value="$(arg leader_odom_topic)"/>
+      <param name="leader_velocity_odom_topic" value="$(arg leader_velocity_odom_topic)"/>
+      <param name="self_pose_topic" value="$(arg self_pose_topic)"/>
+      <param name="self_valid_topic" value="$(arg self_valid_topic)"/>
+      <param name="self_odom_topic" value="$(arg self_odom_topic)"/>
+      <param name="self_velocity_odom_topic" value="$(arg self_velocity_odom_topic)"/>
+      <param name="cmd_vel_topic" value="$(arg cmd_vel_topic)"/>
+    </node>
+
+    <node if="$(arg enable_logger)"
+          pkg="five_ugv_formation_control"
+          type="formation_logger.py"
+          name="formation_logger"
+          output="screen">
+      <param name="robot_name" value="ugv$(arg ugv_id)"/>
+      <param name="leader_name" value="ugv$(arg leader_id)"/>
+      <param name="controller_namespace" value="/ugv$(arg ugv_id)/formation_controller"/>
+      <param name="offset_x" value="$(arg offset_x)"/>
+      <param name="offset_y" value="$(arg offset_y)"/>
+      <param name="offset_yaw" value="$(arg offset_yaw)"/>
+      <param name="algorithm" value="mpc"/>
+      <param name="initial_enabled" value="$(arg auto_enable)"/>
+      <param name="output_root" value="$(arg log_root)"/>
+      <param name="record_rate" value="20.0"/>
+      <param name="leader_pose_topic" value="$(arg leader_pose_topic)"/>
+      <param name="follower_pose_topic" value="$(arg self_pose_topic)"/>
+      <param name="leader_valid_topic" value="$(arg leader_valid_topic)"/>
+      <param name="follower_valid_topic" value="$(arg self_valid_topic)"/>
+      <param name="leader_odom_topic" value="$(arg leader_odom_topic)"/>
+      <param name="leader_velocity_odom_topic" value="$(arg leader_velocity_odom_topic)"/>
+      <param name="follower_odom_topic" value="$(arg self_odom_topic)"/>
+      <param name="leader_cmd_vel_topic" value="$(arg leader_cmd_vel_topic)"/>
+      <param name="cmd_vel_topic" value="$(arg cmd_vel_topic)"/>
+    </node>
+  </group>
+</launch>

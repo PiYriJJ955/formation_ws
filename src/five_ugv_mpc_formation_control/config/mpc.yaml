@@ -1,0 +1,13 @@
+# Shared frame/alignment/watchdog/HOLD/limits are loaded from the existing package.
+mpc_horizon: 12
+mpc_dt: 0.15
+mpc_position_weight: 20.0
+mpc_heading_weight: 0.3
+mpc_terminal_weight: 4.0
+mpc_linear_weight: 0.5
+mpc_angular_weight: 0.05
+mpc_delta_linear_weight: 1.0
+mpc_delta_angular_weight: 0.1
+mpc_max_iterations: 40
+mpc_tolerance: 0.00001
+mpc_solve_timeout: 0.04

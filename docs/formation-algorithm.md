@@ -1,10 +1,14 @@
 # 当前编队算法与限速
 
+控制台第三页“定位方式”后可选择位移控制或 MPC。本文以下描述默认位移控制；
+[MPC 算法、坐标适配与测试说明](../src/five_ugv_mpc_formation_control/README.md) 单独维护。
+两者共用输入处理、航向对齐、使能、HOLD、在线限速和监视接口，切换需要停止后重启。
+
 本项目使用领航—跟随的固定相对位移控制。每辆跟随车独立读取领航车状态，
 以 20 Hz 计算自己的目标位置和速度，再向本车底盘发布 `Twist`。
 领航车由第三页“领航控制”弹窗选择键盘或参考路径控制；编号由第二页选择，与 ROS Master 所在车辆相互独立。
 
-实现：[displacement_follower.py](../src/five_ugv_formation_control/scripts/displacement_follower.py)，
+实现：[follower.py](../src/five_ugv_formation_control/src/five_ugv_formation_control/follower.py)，
 参数：[formation.yaml](../src/five_ugv_formation_control/config/formation.yaml)，
 启动入口：[follower.launch](../src/five_ugv_formation_control/launch/follower.launch)。
 

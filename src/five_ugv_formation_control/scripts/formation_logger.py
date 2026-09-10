@@ -48,7 +48,7 @@ def percentile(values, percent):
 class FormationLogger(object):
     ACTIVE_STATES = ("FOLLOWING", "APPROACH", "HOLD")
     COLUMNS = [
-        "t", "ros_time",
+        "t", "ros_time", "algorithm", "mpc_solve_seconds", "mpc_cost", "mpc_solver_status",
         "leader_x", "leader_y", "leader_pose_stamp", "leader_pose_age",
         "leader_yaw", "leader_odom_stamp", "leader_odom_age",
         "follower_x", "follower_y", "follower_pose_stamp", "follower_pose_age",
@@ -88,6 +88,8 @@ class FormationLogger(object):
         self.values.update({
             "enabled": int(bool(rospy.get_param("~initial_enabled", False))),
             "state": "NO_DATA",
+            "algorithm": rospy.get_param("~algorithm", "displacement"),
+            "mpc_solver_status": "",
             "leader_valid": 0, "follower_valid": 0,
             "leader_anchor_count": 0, "follower_anchor_count": 0,
             "leader_loo_id": -1, "follower_loo_id": -1,
@@ -177,6 +179,11 @@ class FormationLogger(object):
         for name in ("heading_sync_error", "heading_blend", "max_linear", "reference_angular"):
             rospy.Subscriber(self.topic(name + "_topic", "formation_controller/" + name),
                              Float64, self.number_cb, callback_args=name, queue_size=50)
+        if self.values["algorithm"] == "mpc":
+            for name, kind in (("mpc_solve_seconds", Float64), ("mpc_cost", Float64),
+                               ("mpc_solver_status", String)):
+                rospy.Subscriber(self.topic(name + "_topic", "formation_controller/" + name),
+                                 kind, self.number_cb, callback_args=name, queue_size=20)
         rospy.Subscriber(self.topic("leader_cmd_vel_topic", "/ugv0/cmd_vel"),
                          Twist, self.cmd_cb, callback_args="leader", queue_size=50)
         rospy.Subscriber(self.topic("cmd_vel_topic", "/ugv1/cmd_vel"),

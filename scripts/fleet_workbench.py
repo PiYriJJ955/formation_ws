@@ -25,9 +25,11 @@ LOCALIZATION = ROOT / 'src/five_ugv_uwb_localization'
 PROFILE_DIR = LOCALIZATION / 'config/uwb'
 ANCHOR_PROFILES = {'outdoor': '外场', 'indoor': '内场'}
 LOCALIZATION_MODES = ('five_ugv', 'linktrack')
+FORMATION_ALGORITHMS = ('five_ugv_formation_control', 'five_ugv_mpc_formation_control')
 DEFAULTS = {
     'leader': 'ugv1', 'formation_selected': '192.168.0.106,192.168.0.108,192.168.0.109,192.168.0.110,192.168.0.114',
     'localization_mode': 'five_ugv', 'anchor_profile': 'outdoor',
+    'formation_algorithm': 'five_ugv_formation_control',
     'anchors_json': '',
     'anchor_overrides_json': '{}',
     'linear_limit': '',
@@ -140,6 +142,13 @@ def ros_command(options, ip, command):
              shlex.quote('http://%s:11311' % master), shlex.quote(ip), command))
 
 
+def formation_algorithm(options):
+    value = options.get('formation_algorithm', FORMATION_ALGORITHMS[0])
+    if value not in FORMATION_ALGORITHMS:
+        raise ValueError('请选择有效的编队算法包')
+    return value
+
+
 def launch_command(step, options, ip, name, remote, row=None):
     number = robot_number(name)
     helper = 'python -u %s/fleet_ros.py' % shlex.quote(remote)
@@ -157,10 +166,12 @@ def launch_command(step, options, ip, name, remote, row=None):
         leader = robot_number(options['leader'])
         if number == leader:
             raise ValueError('领航车不启动跟随控制器')
-        command = ('%s check --step follower --ids %d; exec flock -n "$HOME/.cache/formation-console/follower.lock" '
-                   'roslaunch five_ugv_formation_control follower.launch ugv_id:=%d leader_id:=%d auto_enable:=false '
+        package = formation_algorithm(options)
+        command = ('%s check --step follower --ids %d --formation-algorithm %s; exec flock -n "$HOME/.cache/formation-console/follower.lock" '
+                   'roslaunch %s follower.launch ugv_id:=%d leader_id:=%d auto_enable:=false '
                    'max_linear:=%s data_timeout:=%s' %
-                   (helper, number, number, leader, saved_linear_limit(options), saved_data_timeout(options)))
+                   (helper, number, package, package, number, leader,
+                    saved_linear_limit(options), saved_data_timeout(options)))
     else:
         raise ValueError('未知启动步骤')
     return ros_command(options, ip, command)
@@ -473,6 +484,7 @@ class FleetWorkbench:
             options = self.app.current_options()
             saved_linear_limit(options)
             saved_data_timeout(options)
+            formation_algorithm(options)
             if options.get('localization_mode', 'five_ugv') not in LOCALIZATION_MODES:
                 raise ValueError('定位方式必须是 five_ugv 或 linktrack')
             if options.get('anchor_profile', 'outdoor') not in ANCHOR_PROFILES:
@@ -491,6 +503,7 @@ class FleetWorkbench:
             for name in names:
                 robot_number(name)
             signature = (options['master_ip'], options['leader'], options['workspace'],
+                         formation_algorithm(options),
                          options.get('localization_mode', 'five_ugv'), options.get('anchor_profile', 'outdoor'),
                          options['anchors_json'],
                          tuple(sorted((ip, row['robot_id'], json.dumps(row.get('formation_config', {}), sort_keys=True))
@@ -1242,12 +1255,23 @@ class FleetWorkbench:
         self.anchor_profile_box.pack(side='left', padx=6)
         self.anchor_profile_box.bind('<<ComboboxSelected>>', self.select_anchor_profile)
         self.ttk.Label(profile, text='可在“编辑基站”中修改、增加、删除基站；切换配置后重新启动定位。').pack(side='left')
-        self.ttk.Label(profile, text='定位方式').pack(side='left', padx=(18, 4))
+        modes = self.ttk.Frame(page)
+        modes.pack(fill='x', pady=(5, 0))
+        self.ttk.Label(modes, text='定位方式').pack(side='left', padx=(0, 4))
         self.localization_mode_box = self.ttk.Combobox(
-            profile, textvariable=self.app.vars['localization_mode'], state='readonly', width=16,
+            modes, textvariable=self.app.vars['localization_mode'], state='readonly', width=16,
             values=LOCALIZATION_MODES)
         self.localization_mode_box.pack(side='left')
-        self.ttk.Label(profile, text='five_ugv 算法 / LinkTrack 输出').pack(side='left', padx=6)
+        self.ttk.Label(modes, text='编队算法').pack(side='left', padx=(18, 4))
+        self.formation_algorithm_box = self.ttk.Combobox(
+            modes, textvariable=self.app.vars['formation_algorithm'], state='readonly', width=34,
+            values=FORMATION_ALGORITHMS)
+        self.formation_algorithm_box.pack(side='left')
+        selected = self.app.vars['formation_algorithm'].get()
+        self._selected_algorithm = selected if selected in FORMATION_ALGORITHMS else FORMATION_ALGORITHMS[0]
+        self.app.vars['formation_algorithm'].set(self._selected_algorithm)
+        self.formation_algorithm_box.bind('<<ComboboxSelected>>', self.select_formation_algorithm)
+        self.ttk.Label(modes, text='停止本次启动后切换，再启动生效').pack(side='left', padx=6)
         self.ttk.Label(page, textvariable=self.leader_status, wraplength=1080).pack(fill='x', pady=4)
         limits = self.ttk.Frame(page)
         limits.pack(fill='x', pady=5)
@@ -1363,6 +1387,14 @@ class FleetWorkbench:
         bottom.pack(pady=6)
         self.ttk.Button(bottom, text='保存基站设置', command=save).pack(side='left', padx=8)
         self.ttk.Button(bottom, text='恢复所选档案默认值', command=lambda: save(True)).pack(side='left')
+
+    def select_formation_algorithm(self, _=None):
+        if self.active():
+            self.app.vars['formation_algorithm'].set(self._selected_algorithm)
+            self.status.set('请先停止本次启动，再切换编队算法')
+            return
+        self._selected_algorithm = formation_algorithm(self.app.current_options())
+        self.app.save()
 
     def select_anchor_profile(self, _=None):
         overrides = json.loads(self.app.vars['anchor_overrides_json'].get())

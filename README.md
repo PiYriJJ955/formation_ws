@@ -167,6 +167,15 @@ ROS Master 和手动 SSH 各自使用独立的窗口。同类任务以标签页�
 
 “停止本次启动”停止本控制台启动的 ROS 终端和实时监视，手动打开的 SSH shell 保留。
 
+### 编队算法切换与 MPC
+
+第三页“定位方式”后新增“编队算法”：默认 `five_ugv_formation_control`，可选择
+`five_ugv_mpc_formation_control`。选择会保存；先停止本次启动再切换，重启后手动使能。
+两种定位方式均使用当前地图位置、里程计航向对齐和编队偏移，共用监视、限速及日志。
+车端 `build.sh` 会检查并安装 MPC 的 NumPy/SciPy 依赖；主机 GUI 不需要安装 ROS。
+旧 `src/MPC` 保留作参考并排除默认构建。
+算法、坐标系、依赖及验证说明见 [MPC 编队包](src/five_ugv_mpc_formation_control/README.md)。
+
 ### 小车定位图页
 
 第三页点击“领航控制…”打开弹窗，选择“键盘控制”或“参考路径”。领航车沿用第二页设置，

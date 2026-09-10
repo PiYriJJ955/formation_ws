@@ -1,0 +1,3 @@
+# Python 3 offline numerical tests; vehicle ROS uses system apt packages.
+numpy>=1.13
+scipy>=0.19

@@ -71,6 +71,33 @@ stat -Lc '%n: %a' -- "${devices[@]}"
                       input_data=(password + '\n').encode('utf-8')).strip()
 
 
+
+def ensure_mpc_dependencies(client, options, cancelled, progress=None):
+    """Install for the vehicle's system ROS Python before the workspace build."""
+    password = options.get('password', '')
+    if '\n' in password or '\r' in password:
+        raise ValueError('sudo 密码不能包含换行符')
+    remote = '/tmp/formation-mpc-deps-%s.sh' % uuid.uuid4().hex
+    try:
+        with client.open_sftp() as sftp:
+            sftp.put(str(Path(__file__).with_name('install_mpc_dependencies.sh')), remote)
+            sftp.chmod(remote, 0o600)
+        command = ("set -e; "
+                   "if [[ -f /opt/ros/melodic/setup.bash ]]; then source /opt/ros/melodic/setup.bash; "
+                   "else source /opt/ros/noetic/setup.bash; fi; "
+                   "bash %s --sudo-stdin" % shlex.quote(remote))
+        if progress:
+            progress('检查 / 安装车端 MPC 依赖')
+        run_remote(client, command, cancelled, progress=progress,
+                   input_data=(password + '\n').encode('utf-8'))
+    finally:
+        try:
+            with client.open_sftp() as sftp:
+                sftp.remove(remote)
+        except Exception:
+            pass
+
+
 def sync_workspace(client, options, ip, robot_id, cancelled, progress=None):
     if not re.fullmatch(r'ugv(?:0|[1-9][0-9]*)', robot_id):
         raise ValueError('车辆编号必须是 ugv0、ugv1 等格式')
@@ -84,6 +111,7 @@ def sync_workspace(client, options, ip, robot_id, cancelled, progress=None):
             sftp.chmod(remote, 0o600)
             sftp.put(str(Path(__file__).with_name('update.sh')), updater)
             sftp.chmod(updater, 0o600)
+        ensure_mpc_dependencies(client, options, cancelled, progress)
         command = ' '.join(['bash', shlex.quote(remote), shlex.quote(robot_id),
                             shell_path(options['workspace']), shlex.quote(options['repository']),
                             shlex.quote(ip), shlex.quote(options['master_ip']), shlex.quote(updater)])

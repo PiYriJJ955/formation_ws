@@ -83,3 +83,22 @@ for robot, aux, expected in [('ugv2', '', 1), ('ugv3', '/dev/uwb_iot_aux', 2)]:
     if aux:
         assert config.params['/ugv3/uwb_iot_aux/iot/port_name'].value == aux
 print('IOT launch checks passed for one sensor and ugv3 left/right sensors.')
+
+# Both algorithms share the namespace, logger, enable, limits and input contract.
+for vehicle, leader in ((2, 1), (5, 3)):
+    prefix = '/ugv%d/formation_controller/' % vehicle
+    config = resolve('five_ugv_mpc_formation_control', 'follower.launch',
+                     ['ugv_id:=%d' % vehicle, 'leader_id:=%d' % leader,
+                      'max_linear:=0.09', 'data_timeout:=0.85'])
+    nodes = [n for n in config.nodes if n.name == 'formation_controller']
+    assert len(nodes) == 1 and nodes[0].package == 'five_ugv_mpc_formation_control'
+    assert nodes[0].type == 'mpc_follower.py'
+    assert config.params[prefix + 'enabled'].value is False
+    assert config.params[prefix + 'leader_pose_topic'].value == '/ugv%d/uwb/pose' % leader
+    assert config.params[prefix + 'self_odom_topic'].value == '/ugv%d/odom_combined' % vehicle
+    assert config.params[prefix + 'cmd_vel_topic'].value == '/ugv%d/cmd_vel' % vehicle
+    assert config.params[prefix + 'max_linear'].value == .09
+    assert config.params[prefix + 'data_timeout'].value == .85
+    assert config.params[prefix + 'mpc_horizon'].value == 12
+    assert config.params['/ugv%d/formation_logger/algorithm' % vehicle].value == 'mpc'
+print('MPC launch contract checked for two independently chosen leaders/followers.')

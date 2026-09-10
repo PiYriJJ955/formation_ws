@@ -1014,5 +1014,72 @@ class WorkbenchChecks(unittest.TestCase):
                 root.destroy()
 
 
+
+    def test_algorithm_selection_routes_both_localizers_and_rejects_unknown_package(self):
+        from fleet_workbench import FORMATION_ALGORITHMS
+        for algorithm in FORMATION_ALGORITHMS:
+            for localization in ('five_ugv', 'linktrack'):
+                options = dict(DEFAULTS, formation_algorithm=algorithm, localization_mode=localization,
+                               leader='ugv3', linear_limit='0.09', data_timeout='0.8')
+                command = launch_command('follower', options, '192.0.2.4', 'ugv4', '/tmp/stage')
+                self.assertIn('roslaunch ' + algorithm + ' follower.launch', command)
+                self.assertIn('--formation-algorithm ' + algorithm, command)
+                for argument in ('ugv_id:=4', 'leader_id:=3', 'auto_enable:=false',
+                                 'max_linear:=0.09', 'data_timeout:=0.8', 'follower.lock'):
+                    self.assertIn(argument, command)
+                chassis = launch_command('chassis', options, '192.0.2.4', 'ugv4', '/tmp/stage')
+                self.assertIn('localization_mode:=' + localization, chassis)
+        with self.assertRaises(ValueError):
+            launch_command('follower', dict(DEFAULTS, formation_algorithm='invalid; command'),
+                           '192.0.2.4', 'ugv4', '/tmp/stage')
+
+    def test_algorithm_selection_is_saved_and_blocked_during_an_active_run(self):
+        import tkinter as tk
+        from fleet_console import save_settings
+        from fleet_workbench import FORMATION_ALGORITHMS
+        interp = tk.Tcl()
+        wb = FleetWorkbench.__new__(FleetWorkbench)
+        wb.app = SimpleNamespace(vars={'formation_algorithm': tk.StringVar(interp, FORMATION_ALGORITHMS[0])})
+        wb.app.current_options = lambda: {'formation_algorithm': wb.app.vars['formation_algorithm'].get()}
+        wb.status = tk.StringVar(interp)
+        wb._selected_algorithm = FORMATION_ALGORITHMS[0]
+        wb.active = lambda: False
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'settings.json'
+            wb.app.save = lambda: save_settings(path, dict(DEFAULTS, **wb.app.current_options()), {})
+            wb.app.vars['formation_algorithm'].set(FORMATION_ALGORITHMS[1])
+            wb.select_formation_algorithm()
+            saved, _ = load_settings(path)
+            self.assertEqual(saved['formation_algorithm'], FORMATION_ALGORITHMS[1])
+            wb.active = lambda: True
+            wb.app.vars['formation_algorithm'].set(FORMATION_ALGORITHMS[0])
+            wb.select_formation_algorithm()
+            self.assertEqual(wb.app.vars['formation_algorithm'].get(), FORMATION_ALGORITHMS[1])
+            self.assertIn('停止', wb.status.get())
+
+    def test_algorithm_widgets_follow_localization_on_third_page(self):
+        import tkinter as tk
+        from fleet_workbench import FORMATION_ALGORITHMS
+        try:
+            root = tk.Tk()
+        except tk.TclError:
+            self.skipTest('No desktop session')
+        root.withdraw()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('fleet_console.connect_ssh', side_effect=AssertionError('Offline test')):
+            app = FleetConsole(root, Path(directory) / 'settings.json')
+            try:
+                wb = app.workbench
+                self.assertEqual(wb.formation_algorithm_box.master, wb.localization_mode_box.master)
+                children = wb.localization_mode_box.master.winfo_children()
+                self.assertGreater(children.index(wb.formation_algorithm_box),
+                                   children.index(wb.localization_mode_box))
+                self.assertEqual(tuple(wb.formation_algorithm_box['values']), FORMATION_ALGORITHMS)
+                self.assertEqual(str(wb.formation_algorithm_box['state']), 'readonly')
+            finally:
+                app.closing = True
+                root.destroy()
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
