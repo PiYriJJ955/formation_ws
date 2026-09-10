@@ -1,0 +1,21 @@
+<launch>
+  <param name="Np" value="5"/>
+  <param name="Nc" value="2"/>
+  <param name="w_low" value="-100"/>  
+  <param name="v_low" value="-100"/> 
+  <param name="dx_beforechange" value="0"/>  
+  <param name="dy_beforechange" value="-0.6"/> 
+  <param name="dx_afterchange" value="0"/>  
+  <param name="dy_afterchange" value="-1.5"/>  
+  <param name="k_dtheta" value="0.1"/> 
+  <param name="weight_Q1" value="1"/>  
+  <param name="weight_Q2" value="1"/> 
+  <param name="weight_Q3" value="0.1"/> 
+  <param name="weight_R" value="1"/>   
+  <param name="weight_S" value="1"/> 
+
+  <node pkg="MPC" type="MPC" name="MPC" output="screen">
+  </node>
+
+</launch>
+

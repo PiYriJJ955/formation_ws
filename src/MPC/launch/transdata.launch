@@ -1,0 +1,37 @@
+<launch>
+  <include file="$(find turn_on_wheeltec_robot)/launch/turn_on_wheeltec_robot.launch">
+	    <arg name="navigation"  default="false"/>
+  </include>
+
+  <include file="$(find nlink_parser)/launch/iot.launch"/>
+
+  <include file="$(find nlink_parser)/launch/linktrack.launch"/>
+
+  <node pkg="MPC" type="absolute_location" name="absolute_location" output="screen">
+  <!-- 可调的 UWB ID -->
+  <param name="id_1" value="10"/>
+  <param name="id_2" value="11"/>
+  <param name="id_3" value="12"/>
+
+  <!-- 可调的基站坐标 -->
+  <param name="beacon1" value="[-1.2, 0.0]"/>
+  <param name="beacon2" value="[-1.2, 2.4]"/>
+  <param name="beacon3" value="[1.2, 0.0]"/>
+  </node>
+
+  <node pkg="MPC" type="UWBdata" name="UWBdata" output="screen">
+  </node>
+
+  <node pkg="MPC" type="getabsolutedata" name="getabsolutedata" output="screen">
+  </node>  
+
+  <node pkg="MPC" type="imu_fusion" name="imu_fusion" output="screen">
+  </node>  
+
+  <node pkg="MPC" type="send102.py" name="send102" output="screen">
+  </node>  
+
+  <node pkg="MPC" type="listen100.py" name="listen100" output="screen">
+  </node>    
+
+</launch>
