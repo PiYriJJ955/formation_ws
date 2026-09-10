@@ -10,4 +10,4 @@ mpc_delta_linear_weight: 1.0
 mpc_delta_angular_weight: 0.1
 mpc_max_iterations: 40
 mpc_tolerance: 0.00001
-mpc_solve_timeout: 0.04
+mpc_solve_timeout: 0.2
