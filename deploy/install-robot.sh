@@ -36,7 +36,7 @@ git remote set-url origin "$repository"
 git config pull.ff only
 # This LAN URL must bypass any shell-level HTTP proxy.
 git config http.proxy ''
-bash scripts/update.sh
+bash scripts/update.sh --discard-local-changes
 revision=$(git rev-parse HEAD)
 if [[ ! -f devel/setup.bash || ! -f .local/built-revision ]] || \
    [[ "$(<.local/built-revision)" != "$revision" || "$(git rev-parse origin/master)" != "$revision" ]]; then

@@ -76,7 +76,9 @@ python3 scripts/fleet_console.py
 选中 IP 后，点击“同步选中车辆”可立即同步；Ctrl / Shift 可多选批量执行。
 按钮也会为尚未连接的选中 IP 建立 SSH 连接。同步会先停止本界面启动的底盘，
 成功后根据“连接后启动底盘”选项恢复启动；其他 ROS 任务使更新延期时显示“等待更新”。
-本地修改、分叉或错误分支会保留并报告，不执行强制覆盖。
+定时更新遇到本地修改会保留并报告，不执行强制覆盖；控制台的“同步选中车辆”会按本次部署要求
+丢弃车端 Git 管理文件的本地修改后再更新。车端 `~/.config/formation/robot.env` 在 Git 工作区外，
+不会被这个操作覆盖。
 同步读取 HTTP 仓库的 `master` 分支；主机改动提交并 `git push` 后即可分发。
 GUI 临时上传主机当前的安装脚本完成引导，车端受 Git 管理的文件按仓库版本更新。
 新发现车辆分配并记住可用的 `ugvN` 编号，已有 `robot.env` 的编号和配置会保留。
@@ -141,9 +143,11 @@ IOT launch，弹窗显示距离、水平角曲线，并记录原始 bag。详见
 3. 用“编辑选中车 UWB 串口 / 编队偏移”配置新车的真实串口和跟随偏移。串口、偏移
    沿用车端配置；保存的自定义值在执行“配置检查”或“快捷总启动”时通过 SSH 写回 `robot.env`。
    在第三页检查基站坐标和标签高度。车辆启动时朝向 UWB 地图 +X，供现有算法初始化航向。
+   定位方式可选 `five_ugv`（本项目鲁棒 UWB EKF）或 `linktrack`（`nlink_parser` 的
+   `linktrack.launch` NodeFrame2 输出）；后者直接使用 LinkTrack 自带位姿。
 4. 点击“快捷总启动”。程序停止控制台原先的独立底盘，关闭自动启动和循环扫描，然后依次
    同步所选车辆编号 / Master / ROS_IP / mini_4wd → 检查或启动 Master → 启动各车底盘与 UWB
-   定位 → 启动跟随控制器 → 连接实时监视。Master IP 对应主机也需能使用同一 SSH 设置登录，
+   定位 → 并行启动跟随控制器 → 连接实时监视。Master IP 对应主机也需能使用同一 SSH 设置登录，
    且已安装工作空间。各车等待真实里程计和有效 UWB 数据，最长 45 秒；失败保留已经打开的
    终端供检查，后续步骤停止，结果弹窗说明失败的车辆。
 5. 总启动完成时跟随尚未使能。先在第三页确认位置，在第二页“5 · 监视与使能”点击
@@ -220,7 +224,11 @@ Esc、键盘控制区内的空格键，以及“立即停车 / 禁用跟随”�
 领航车箭头使用对齐到 UWB 地图的控制航向；跟随车箭头沿用连接监视时的朝向为 +X 参考。
 重连监视时重新建立参考，领航车需静止等待对齐。
 
-默认六个基站直接读取 `src/five_ugv_uwb_localization/config/final_localization.yaml`：
+第三页的“UWB 基站配置”可以选择 `config/uwb/outdoor.yaml`（外场）或
+`config/uwb/indoor.yaml`（内场）。选择后，编辑器支持修改、增加和删除基站；
+配置会在下次启动定位时上传到车辆。两个档案的解算参数仍以
+`config/final_localization.yaml` 为基础。内场档案目前使用现有布局作为初值，请在控制台中换成内场实测坐标。
+现有布局为：
 ID 0 / 4 / 1 位于下边，3 / 5 / 2 位于上边，场地 6.4 × 4.4 米，基站高度 1.35 米，标签高度 0.25 米。
 “编辑基站坐标 / 定位参数”可增加、删除或修改 ID、X、Y、Z、车载标签高度和有效残差阈值；
 残差阈值默认 0.6 米。
@@ -309,6 +317,9 @@ ROS 停止后，工作区干净且位于 `master` 时执行快进更新与构建
 # 小车：立即更新并编译
 cd /home/wheeltec/formation_ws
 bash scripts/update.sh
+
+# 按控制台同步策略丢弃车端 Git 管理文件的旧修改后更新
+bash scripts/update.sh --discard-local-changes
 
 # 检查版本、构建版本和更新服务
 git rev-parse --short HEAD
@@ -409,7 +420,8 @@ bash deploy/install-robot.sh ugv1   # 按上方 IP 表选择 ugv1–ugv5
 脚本支持 `ugvN` 编号；GUI 自动传入工作空间、仓库地址、本车 IP 和初始 Master IP。
 已存在的车端配置会保留。
 
-主机 HTTP 服务是用户级 `formation-git-http.service`，由控制台启动。
+主机 HTTP 服务是用户级 `formation-git-http.service`，由控制台启动；如果当前电脑尚未安装
+该 unit，控制台会自动安装当前仓库的服务文件后再启动。
 首次配置、升级服务或移动主机仓库目录后，在仓库根目录执行：
 
 ```bash

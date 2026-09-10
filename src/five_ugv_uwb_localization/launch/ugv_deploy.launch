@@ -1,5 +1,6 @@
 <launch>
   <arg name="localization_config" default="$(find five_ugv_uwb_localization)/config/final_localization.yaml"/>
+  <arg name="localization_mode" default="five_ugv"/>
   <arg name="ugv_id" default="$(optenv UGV_ID 1)"/>
   <arg name="port_name" default="$(optenv UWB_PORT /dev/ttyCH343USB2)"/>
   <arg name="baud_rate" default="921600"/>
@@ -8,29 +9,45 @@
 
   <group ns="ugv$(arg ugv_id)">
 
-    <node pkg="nlink_parser"
-          type="linktrack"
-          name="linktrack"
-          output="screen">
-      <param name="port_name" value="$(arg port_name)"/>
-      <param name="baud_rate" value="$(arg baud_rate)"/>
-      <remap from="/nlink_linktrack_nodeframe2"
-             to="/ugv$(arg ugv_id)/nlink_linktrack_nodeframe2"/>
-    </node>
+    <group if="$(eval arg('localization_mode') == 'five_ugv')">
+      <node pkg="nlink_parser"
+            type="linktrack"
+            name="linktrack"
+            output="screen">
+        <param name="port_name" value="$(arg port_name)"/>
+        <param name="baud_rate" value="$(arg baud_rate)"/>
+        <remap from="/nlink_linktrack_nodeframe2"
+               to="/ugv$(arg ugv_id)/nlink_linktrack_nodeframe2"/>
+      </node>
 
-    <node pkg="five_ugv_uwb_localization"
-          type="robust_uwb_localizer.py"
-          name="uwb_localizer"
-          output="screen">
-      <!-- Tiny EKF matrices: threaded BLAS wastes CPU and delays callbacks on Jetson. -->
-      <env name="OPENBLAS_NUM_THREADS" value="1"/>
-      <env name="GOTO_NUM_THREADS" value="1"/>
-      <env name="OMP_NUM_THREADS" value="1"/>
-      <rosparam command="load"
-                file="$(arg localization_config)"/>
-      <param name="input_topic"
-             value="/ugv$(arg ugv_id)/nlink_linktrack_nodeframe2"/>
-    </node>
+      <node pkg="five_ugv_uwb_localization"
+            type="robust_uwb_localizer.py"
+            name="uwb_localizer"
+            output="screen">
+        <!-- Tiny EKF matrices: threaded BLAS wastes CPU and delays callbacks on Jetson. -->
+        <env name="OPENBLAS_NUM_THREADS" value="1"/>
+        <env name="GOTO_NUM_THREADS" value="1"/>
+        <env name="OMP_NUM_THREADS" value="1"/>
+        <rosparam command="load"
+                  file="$(arg localization_config)"/>
+        <param name="input_topic"
+               value="/ugv$(arg ugv_id)/nlink_linktrack_nodeframe2"/>
+      </node>
+    </group>
+
+    <group if="$(eval arg('localization_mode') == 'linktrack')">
+      <include file="$(find nlink_parser)/launch/linktrack.launch">
+        <arg name="port_name" value="$(arg port_name)"/>
+        <arg name="baud_rate" value="$(arg baud_rate)"/>
+      </include>
+      <node pkg="five_ugv_uwb_localization"
+            type="nlink_localizer.py"
+            name="nlink_localizer"
+            output="screen">
+        <param name="input_topic" value="nlink_linktrack_nodeframe2"/>
+        <param name="world_frame" value="linktrack_map"/>
+      </node>
+    </group>
 
     <!-- Each UGV records only its own localization/UWB data -->
     <node if="$(arg enable_logger)"

@@ -1,5 +1,6 @@
 """Formation startup, SSH terminals, leader keyboard control and UWB map."""
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 import ipaddress
 import json
@@ -21,8 +22,12 @@ from leader_tracker import parse_points, check_bounds, curve_point, sample_path
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCALIZATION = ROOT / 'src/five_ugv_uwb_localization'
+PROFILE_DIR = LOCALIZATION / 'config/uwb'
+ANCHOR_PROFILES = {'outdoor': '外场', 'indoor': '内场'}
+LOCALIZATION_MODES = ('five_ugv', 'linktrack')
 DEFAULTS = {
     'leader': 'ugv1', 'formation_selected': '192.168.0.106,192.168.0.108,192.168.0.109,192.168.0.110,192.168.0.114',
+    'localization_mode': 'five_ugv', 'anchor_profile': 'outdoor',
     'anchors_json': '',
     'linear_limit': '',
     'leader_control_mode': 'keyboard', 'leader_path': '2.0, 2.2\n3.0, 2.2\n3.0, 2.8',
@@ -88,9 +93,14 @@ def saved_data_timeout(options):
     return value
 
 
-@lru_cache(maxsize=16)
-def localization_config(encoded=''):
+@lru_cache(maxsize=32)
+def localization_config(encoded='', profile='outdoor'):
+    if profile not in ANCHOR_PROFILES:
+        profile = 'outdoor'
     base = yaml.safe_load((LOCALIZATION / 'config/final_localization.yaml').read_text())
+    path = PROFILE_DIR / (profile + '.yaml')
+    if path.exists():
+        base.update(yaml.safe_load(path.read_text()) or {})
     if encoded:
         custom = json.loads(encoded)
         base.update(anchors=custom['anchors'], tag_height=custom['tag_height'])
@@ -115,9 +125,8 @@ def localization_config(encoded=''):
     if not any(abs((b['x'] - a['x']) * (c['y'] - a['y']) -
                    (b['y'] - a['y']) * (c['x'] - a['x'])) > 1e-5 for b in anchors for c in anchors):
         raise ValueError('基站在 XY 平面不能全部共线')
-    if encoded:
-        base.update(workspace_x_min=min(a['x'] for a in anchors), workspace_x_max=max(a['x'] for a in anchors),
-                    workspace_y_min=min(a['y'] for a in anchors), workspace_y_max=max(a['y'] for a in anchors))
+    base.update(workspace_x_min=min(a['x'] for a in anchors), workspace_x_max=max(a['x'] for a in anchors),
+                workspace_y_min=min(a['y'] for a in anchors), workspace_y_max=max(a['y'] for a in anchors))
     return base
 
 
@@ -136,9 +145,13 @@ def launch_command(step, options, ip, name, remote, row=None):
     if step == 'master':
         command = 'exec roscore'
     elif step == 'chassis':
-        command = ('%s check --step chassis --ids %d; exec flock -n "$HOME/.cache/formation-console/chassis.lock" '
-                   'roslaunch %s/ugv.launch ugv_id:=%d car_mode:=mini_4wd localization_config:=%s/localization.yaml' %
-                   (helper, number, shlex.quote(remote), number, shlex.quote(remote)))
+        command = ('%s check --step chassis --localization-mode %s --ids %d; '
+                   'exec flock -n "$HOME/.cache/formation-console/chassis.lock" '
+                   'roslaunch %s/ugv.launch ugv_id:=%d car_mode:=mini_4wd localization_mode:=%s '
+                   'localization_config:=%s/localization.yaml' %
+                   (helper, shlex.quote(options.get('localization_mode', 'five_ugv')), number,
+                    shlex.quote(remote), number, shlex.quote(options.get('localization_mode', 'five_ugv')),
+                    shlex.quote(remote)))
     elif step == 'follower':
         leader = robot_number(options['leader'])
         if number == leader:
@@ -458,10 +471,14 @@ class FleetWorkbench:
             options = self.app.current_options()
             saved_linear_limit(options)
             saved_data_timeout(options)
+            if options.get('localization_mode', 'five_ugv') not in LOCALIZATION_MODES:
+                raise ValueError('定位方式必须是 five_ugv 或 linktrack')
+            if options.get('anchor_profile', 'outdoor') not in ANCHOR_PROFILES:
+                raise ValueError('UWB 基站配置不存在')
             addresses = self.addresses()
             ipaddress.IPv4Address(options['master_ip'])
             robot_number(options['leader'])
-            config = localization_config(options['anchors_json'])
+            config = localization_config(options['anchors_json'], options.get('anchor_profile', 'outdoor'))
             rows = {ip: dict(self.app.robots[ip], robot_id=self.app.robots[ip].get('pending_id') or
                             self.app.robot_id_for(ip)) for ip in addresses}
             names = [row['robot_id'] for row in rows.values()]
@@ -471,7 +488,9 @@ class FleetWorkbench:
                 raise ValueError('请同时选择领航车 ' + options['leader'])
             for name in names:
                 robot_number(name)
-            signature = (options['master_ip'], options['leader'], options['workspace'], options['anchors_json'],
+            signature = (options['master_ip'], options['leader'], options['workspace'],
+                         options.get('localization_mode', 'five_ugv'), options.get('anchor_profile', 'outdoor'),
+                         options['anchors_json'],
                          tuple(sorted((ip, row['robot_id'], json.dumps(row.get('formation_config', {}), sort_keys=True))
                                       for ip, row in rows.items())))
             if self.active() and self.signature and self.signature != signature:
@@ -582,25 +601,27 @@ class FleetWorkbench:
             results[master] = 'ROS Master 已就绪'
             self.events.put(('state', master, results[master]))
             if step in ('all', 'chassis', 'follower'):
+                jobs = []
+                stage = 'chassis' if step in ('all', 'chassis') else 'follower'
                 for ip, row in rows.items():
                     current = ip
                     name = row['robot_id']
-                    stage = 'chassis' if step in ('all', 'chassis') else 'follower'
                     if stage == 'follower' and name == options['leader']:
                         continue
                     if self.cancel.is_set():
                         raise RuntimeError('启动已取消')
                     launched[ip] = self.launch(stage, ip, name, options, remotes[ip])
-                for ip, row in rows.items():
-                    current = ip
-                    name = row['robot_id']
-                    stage = 'chassis' if step in ('all', 'chassis') else 'follower'
-                    if stage == 'follower' and name == options['leader']:
-                        continue
-                    self.wait_ready(clients[ip], options, ip, name, remotes[ip], stage, launched[ip])
-                    results[ip] = stage + ' 已就绪'
-                    self.events.put(('state', ip, results[ip]))
+                    jobs.append((ip, row, stage))
+                if stage == 'follower':
+                    self.wait_ready_parallel(jobs, clients, options, remotes, launched, results)
+                else:
+                    for ip, row, stage in jobs:
+                        current = ip
+                        self.wait_ready(clients[ip], options, ip, row['robot_id'], remotes[ip], stage, launched[ip])
+                        results[ip] = stage + ' 已就绪'
+                        self.events.put(('state', ip, results[ip]))
             if step == 'all':
+                jobs = []
                 for ip, row in rows.items():
                     current = ip
                     if row['robot_id'] == options['leader']:
@@ -608,9 +629,10 @@ class FleetWorkbench:
                     if self.cancel.is_set():
                         raise RuntimeError('启动已取消')
                     terminal = self.launch('follower', ip, row['robot_id'], options, remotes[ip])
-                    self.wait_ready(clients[ip], options, ip, row['robot_id'], remotes[ip], 'follower', terminal)
-                    results[ip] = '底盘 / 定位 / 跟随已就绪（未使能）'
-                    self.events.put(('state', ip, results[ip]))
+                    launched[ip] = terminal
+                    jobs.append((ip, row, 'follower'))
+                self.wait_ready_parallel(jobs, clients, options, remotes, launched, results,
+                                         ready_text='底盘 / 定位 / 跟随已就绪（未使能）')
             if step in ('all', 'monitor', 'chassis'):
                 current = master
                 if self.cancel.is_set():
@@ -642,6 +664,7 @@ class FleetWorkbench:
                             raise RuntimeError('实时监视未就绪，检查 SSH / ROS Master')
             self.events.put(('done', '启动任务完成；在“监视与使能”检查并使能跟随。', results))
         except Exception as error:
+            current = getattr(error, 'formation_ip', current)
             results[current] = '失败：' + str(error)
             self.events.put(('state', current, results[current]))
             self.events.put(('done', '启动未完成；已启动步骤保留供检查，可点击“停止本次启动”。', results))
@@ -666,6 +689,24 @@ class FleetWorkbench:
         self.events.put(('state', ip, '等待 ' + step + ' 数据（最长 45 秒）'))
         run_remote(client, command, self.cancel, timeout=55, progress=check_terminal)
         check_terminal()
+
+    def wait_ready_parallel(self, jobs, clients, options, remotes, launched, results,
+                            ready_text=None):
+        if not jobs:
+            return
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            futures = {pool.submit(self.wait_ready, clients[ip], options, ip, row['robot_id'],
+                                    remotes[ip], stage, launched[ip]): (ip, stage)
+                       for ip, row, stage in jobs}
+            for future in as_completed(futures):
+                ip, stage = futures[future]
+                try:
+                    future.result()
+                except Exception as error:
+                    error.formation_ip = ip
+                    raise
+                results[ip] = ready_text if ready_text else stage + ' 已就绪'
+                self.events.put(('state', ip, results[ip]))
 
     def set_enabled(self, enabled):
         if not self.monitor or not self.monitor.ready:
@@ -1027,7 +1068,8 @@ class FleetWorkbench:
 
     def check_curve_bounds(self, points, bends):
         sampled = sample_path(points, bends, min_points=0)
-        config = localization_config(self.app.vars['anchors_json'].get())
+        config = localization_config(self.app.vars['anchors_json'].get(),
+                                     self.app.vars['anchor_profile'].get())
         offsets = list(self.active_offsets.values()) if self.monitor and self.monitor.enable else []
         check_bounds(sampled, path_bounds(config), offsets)
 
@@ -1189,6 +1231,21 @@ class FleetWorkbench:
         self.ttk.Button(toolbar, text='清空轨迹', command=self.clear_trails).pack(side='left')
         self.ttk.Button(toolbar, text='立即停车 / 禁用跟随', command=self.emergency).pack(side='right')
         self.ttk.Button(toolbar, text='领航控制…', command=self.open_leader_control).pack(side='left', padx=8)
+        profile = self.ttk.Frame(page)
+        profile.pack(fill='x', pady=(4, 0))
+        self.ttk.Label(profile, text='UWB 基站配置').pack(side='left')
+        self.anchor_profile_box = self.ttk.Combobox(
+            profile, textvariable=self.app.vars['anchor_profile'], state='readonly', width=12,
+            values=list(ANCHOR_PROFILES))
+        self.anchor_profile_box.pack(side='left', padx=6)
+        self.anchor_profile_box.bind('<<ComboboxSelected>>', self.select_anchor_profile)
+        self.ttk.Label(profile, text='可在“编辑基站”中修改、增加、删除基站；切换配置后重新启动定位。').pack(side='left')
+        self.ttk.Label(profile, text='定位方式').pack(side='left', padx=(18, 4))
+        self.localization_mode_box = self.ttk.Combobox(
+            profile, textvariable=self.app.vars['localization_mode'], state='readonly', width=16,
+            values=LOCALIZATION_MODES)
+        self.localization_mode_box.pack(side='left')
+        self.ttk.Label(profile, text='five_ugv 算法 / LinkTrack 输出').pack(side='left', padx=6)
         self.ttk.Label(page, textvariable=self.leader_status, wraplength=1080).pack(fill='x', pady=4)
         limits = self.ttk.Frame(page)
         limits.pack(fill='x', pady=5)
@@ -1205,7 +1262,7 @@ class FleetWorkbench:
         self.limits_status = self.tk.StringVar()
         self.ttk.Label(limits, textvariable=self.limits_status, wraplength=430).pack(side='left', padx=10)
         self.refresh_limits()
-        self.map_status = self.tk.StringVar(value='尚未连接。基站坐标读取自 final_localization.yaml；单位：米。')
+        self.map_status = self.tk.StringVar(value='尚未连接。基站坐标读取自所选 UWB 配置；单位：米。')
         self.ttk.Label(page, textvariable=self.map_status, wraplength=1080).pack(fill='x', pady=7)
         self.ttk.Label(page, text='三角形：基站　圆点：车辆　实线：实际轨迹　虚线：目标 / 误差　紫色虚线：参考路径　灰色：定位过期或无效').pack(anchor='w')
         self.canvas = self.tk.Canvas(page, background='#f7fafc', highlightthickness=0, takefocus=True)
@@ -1238,7 +1295,8 @@ class FleetWorkbench:
         dialog = self.tk.Toplevel(self.root)
         dialog.title('基站坐标与定位参数')
         dialog.geometry('610x530')
-        config = localization_config(self.app.vars['anchors_json'].get())
+        config = localization_config(self.app.vars['anchors_json'].get(),
+                                     self.app.vars['anchor_profile'].get())
         table = self.ttk.Treeview(dialog, columns=('id', 'x', 'y', 'z'), show='headings', height=9)
         for key in ('id', 'x', 'y', 'z'):
             table.heading(key, text='ID' if key == 'id' else key.upper() + (' 高度' if key == 'z' else ''))
@@ -1292,7 +1350,7 @@ class FleetWorkbench:
                 encoded = '' if reset else json.dumps(dict(
                     anchors=anchors, tag_height=float(height.get()),
                     valid_max_residual_rms=float(residual_limit.get())))
-                localization_config(encoded)
+                localization_config(encoded, self.app.vars['anchor_profile'].get())
                 self.app.vars['anchors_json'].set(encoded)
                 self.app.save()
                 self.clear_trails()
@@ -1302,7 +1360,14 @@ class FleetWorkbench:
         bottom = self.ttk.Frame(dialog)
         bottom.pack(pady=6)
         self.ttk.Button(bottom, text='保存基站设置', command=save).pack(side='left', padx=8)
-        self.ttk.Button(bottom, text='恢复代码默认值', command=lambda: save(True)).pack(side='left')
+        self.ttk.Button(bottom, text='恢复所选档案默认值', command=lambda: save(True)).pack(side='left')
+
+    def select_anchor_profile(self, _=None):
+        self.app.vars['anchors_json'].set('')
+        self.clear_trails()
+        self.map_status.set('已切换到%s；下次启动定位时生效。' %
+                            ANCHOR_PROFILES.get(self.app.vars['anchor_profile'].get(), '选定'))
+        self.app.save()
 
     def fresh(self, number, now):
         row = self.samples.get(number, {})
@@ -1320,7 +1385,8 @@ class FleetWorkbench:
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width < 100 or height < 100:
             return
-        config = localization_config(self.app.vars['anchors_json'].get())
+        config = localization_config(self.app.vars['anchors_json'].get(),
+                                     self.app.vars['anchor_profile'].get())
         try:
             data_timeout = saved_data_timeout(self.app.current_options())
         except (TypeError, ValueError):
@@ -1425,10 +1491,13 @@ class FleetWorkbench:
                            (number, pose[0], pose[1], error_text, rms, state_text + ' · UWB ' +
                             (row.get('uwb_status', {}).get('value', '—') if row.get('uwb_status', {}).get('age', 999) + now-self.last_sample < data_timeout else '数据过期')))
         online = self.monitor and self.monitor.ready and now - self.last_sample < 2
+        profile_name = ANCHOR_PROFILES.get(self.app.vars['anchor_profile'].get(), '未知配置')
+        if self.app.vars['anchors_json'].get():
+            profile_name += '（已自定义）'
         self.map_status.set('%s · 基站 %d 个 · 标签高度 %.2f m · 有效残差阈值 %.2f m · %s' %
                             ('实时监视已连接' if online else '实时监视未连接 / 数据过期', len(anchors), config['tag_height'],
                              config['valid_max_residual_rms'],
-                             '自定义基站（新启动定位时生效）' if self.app.vars['anchors_json'].get() else '代码默认基站'))
+                             profile_name + '（新启动定位时生效）'))
         self.metrics.set('\n'.join(metrics) if metrics else '暂无实时误差数据。领航航向对齐到 UWB 地图；跟随车航向以连接时的朝向为 +X 参考。')
 
     def poll(self):

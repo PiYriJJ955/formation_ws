@@ -91,6 +91,34 @@ class WorkbenchChecks(unittest.TestCase):
             workbench.wait_ready(clients['192.168.0.106'], DEFAULTS, '192.168.0.106', 'ugv0',
                                  '/tmp/stage', 'chassis', failed_terminal)
 
+    def test_follow_readiness_waits_in_parallel(self):
+        workbench = FleetWorkbench.__new__(FleetWorkbench)
+        workbench.cancel = threading.Event()
+        workbench.events = queue.Queue()
+        barrier = threading.Barrier(2)
+        entered = []
+        def wait(*_args):
+            entered.append(True)
+            barrier.wait(2)
+        workbench.wait_ready = wait
+        jobs = [('one', {'robot_id': 'ugv2'}, 'follower'),
+                ('two', {'robot_id': 'ugv3'}, 'follower')]
+        clients = {'one': object(), 'two': object()}
+        launched = {'one': object(), 'two': object()}
+        results = {}
+        workbench.wait_ready_parallel(jobs, clients, {}, {'one': '/tmp/one', 'two': '/tmp/two'},
+                                      launched, results)
+        self.assertEqual(len(entered), 2)
+        self.assertEqual(results, {'one': 'follower 已就绪', 'two': 'follower 已就绪'})
+        def fail(_client, _options, ip, *_args):
+            if ip == 'one':
+                raise RuntimeError('failed')
+        workbench.wait_ready = fail
+        with self.assertRaises(RuntimeError) as raised:
+            workbench.wait_ready_parallel(jobs, clients, {}, {'one': '/tmp/one', 'two': '/tmp/two'},
+                                          launched, {})
+        self.assertEqual(raised.exception.formation_ip, 'one')
+
     def test_gui_heartbeat_failure_closes_shared_monitor(self):
         closed = []
         channel = SimpleNamespace(set_combine_stderr=lambda *_: None, settimeout=lambda *_: None,

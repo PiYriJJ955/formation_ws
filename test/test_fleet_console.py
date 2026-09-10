@@ -57,6 +57,22 @@ class ConsoleChecks(unittest.TestCase):
                 self.assertIn(data['urls'][0], data['text'])
         self.assertEqual(stopped.wait.call_count, 4)
 
+    def test_git_server_installs_missing_user_unit(self):
+        events, stopped = queue.Queue(), Mock()
+        stopped.is_set.side_effect = [False, True]
+        missing = subprocess.CompletedProcess([], 1, '',
+                                              'Failed to start formation-git-http.service: '
+                                              'Unit formation-git-http.service not found.')
+        active = subprocess.CompletedProcess([], 0, 'active\n', '')
+        with patch('fleet_console.subprocess.run', side_effect=[missing,
+                subprocess.CompletedProcess([], 0, '', ''), active, active]) as run, \
+                patch('fleet_console.server_info', return_value={'authentication': 'password'}), \
+                patch('fleet_console.local_git_urls', return_value=[]):
+            watch_git_server(events, stopped)
+        self.assertEqual(run.call_args_list[1][0][0][-1], '--install-service')
+        self.assertEqual(run.call_args_list[2][0][0][-2:], ['start', 'formation-git-http.service'])
+        self.assertTrue(events.get_nowait()[2]['running'])
+
     def test_git_server_reports_start_and_status_errors_then_recovers(self):
         for failure in (subprocess.CompletedProcess([], 1, '', 'Unit not found'),
                         FileNotFoundError('systemctl not found'),

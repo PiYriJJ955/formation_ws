@@ -44,7 +44,10 @@ with tempfile.TemporaryDirectory(prefix='formation-update-') as directory:
     (robot / 'version').write_text('local edit\n')
     assert run('bash', 'scripts/update.sh', cwd=robot, ok=False).returncode != 0
     assert (robot / 'version').read_text() == 'local edit\n'
-    (robot / 'version').write_text('one\n')
+    result = run('bash', 'scripts/update.sh', '--discard-local-changes', cwd=robot)
+    assert 'Workspace ready' in result.stdout, result.stdout
+    assert (robot / 'version').read_text() == 'two\n'
+    revision = run('git', 'rev-parse', 'HEAD', cwd=robot).stdout.strip()
 
     process = subprocess.Popen(['bash', '-c', 'exec -a roslaunch sleep 30'])
     try:
@@ -55,9 +58,10 @@ with tempfile.TemporaryDirectory(prefix='formation-update-') as directory:
         process.terminate()
         process.wait()
 
+    (robot / '.local/built-revision').write_text('old\n')
     (robot / '.local/fail-build').touch()
     assert run('bash', 'scripts/update.sh', cwd=robot, ok=False).returncode != 0
-    assert (robot / '.local/built-revision').read_text().strip() == revision
+    assert (robot / '.local/built-revision').read_text().strip() == 'old'
     (robot / '.local/fail-build').unlink()
     run('bash', 'scripts/update.sh', cwd=robot)
     revision = run('git', 'rev-parse', 'HEAD', cwd=robot).stdout.strip()

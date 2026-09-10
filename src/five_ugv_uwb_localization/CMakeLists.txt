@@ -6,6 +6,7 @@ catkin_install_python(PROGRAMS
   scripts/robust_range_ekf.py
   scripts/calibrate_uwb.py
   scripts/robust_uwb_localizer.py
+  scripts/nlink_localizer.py
   scripts/offline_logger.py
   scripts/formation_controller.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

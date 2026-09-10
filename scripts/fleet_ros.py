@@ -84,6 +84,7 @@ def main():
     parser.add_argument('--ids', default='0,1,2')
     parser.add_argument('--leader', type=int, default=0)
     parser.add_argument('--step', choices=['chassis', 'follower'], default='chassis')
+    parser.add_argument('--localization-mode', choices=['five_ugv', 'linktrack'], default='five_ugv')
     parser.add_argument('--linear-limits', default='')
     parser.add_argument('--offsets', default='{}')
     parser.add_argument('--bounds', default='')
@@ -101,7 +102,8 @@ def main():
             raise RuntimeError('Cannot read ROS Master state')
         registered = set(node for group in result[2] for _, nodes in group for node in nodes)
         for number in ids:
-            node = '/ugv%d/%s' % (number, 'formation_controller' if args.step == 'follower' else 'uwb_localizer')
+            node = '/ugv%d/%s' % (number, 'formation_controller' if args.step == 'follower' else
+                                   ('nlink_localizer' if args.localization_mode == 'linktrack' else 'uwb_localizer'))
             if node in registered:
                 raise RuntimeError('Node already registered; stop its existing launch first: ' + node)
         return

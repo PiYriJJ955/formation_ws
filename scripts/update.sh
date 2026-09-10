@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -e
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+discard_local_changes=false
+if [[ "${1:-}" == '--discard-local-changes' ]]; then
+    discard_local_changes=true
+elif [[ -n "${1:-}" ]]; then
+    echo 'Usage: scripts/update.sh [--discard-local-changes]' >&2
+    exit 2
+fi
 mkdir -p .local
 exec 9>.local/update.lock
 flock -n 9 || exit 0
@@ -12,8 +19,16 @@ if pgrep -f '(^|/)(roslaunch|roscore|rosmaster)( |$)|wheeltec_robot_node|displac
     exit 0
 fi
 if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
-    echo 'Local changes found; commit or move them before updating.' >&2
-    exit 1
+    if [[ "$discard_local_changes" == true ]]; then
+        git reset --hard HEAD
+        [[ -z "$(git status --porcelain --untracked-files=normal)" ]] || {
+            echo 'Untracked files found; remove or move them before updating.' >&2
+            exit 1
+        }
+    else
+        echo 'Local changes found; commit or move them before updating.' >&2
+        exit 1
+    fi
 fi
 [[ "$(git symbolic-ref --short HEAD)" == master ]] || { echo 'Expected master branch.' >&2; exit 1; }
 git merge-base --is-ancestor HEAD origin/master || { echo 'Local commits are not on the server; update stopped.' >&2; exit 1; }

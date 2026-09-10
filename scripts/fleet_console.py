@@ -17,6 +17,7 @@ import re
 import shlex
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -58,8 +59,20 @@ def watch_git_server(events, stopped):
     try:
         result = subprocess.run(command + ['start', service], stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, universal_newlines=True, timeout=15)
+        missing = result.returncode and service in result.stderr and (
+            'not found' in result.stderr.lower() or 'could not be found' in result.stderr.lower())
+        if missing:
+            installer = [sys.executable, str(Path(__file__).with_name('git_http_server.py')),
+                         '--install-service']
+            installed = subprocess.run(installer, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       universal_newlines=True, timeout=30)
+            if installed.returncode:
+                startup_error = installed.stderr.strip() or 'Git 服务安装失败'
+            else:
+                result = subprocess.run(command + ['start', service], stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, universal_newlines=True, timeout=15)
         if result.returncode:
-            startup_error = result.stderr.strip() or '服务启动失败'
+            startup_error = startup_error or result.stderr.strip() or '服务启动失败'
     except (OSError, subprocess.TimeoutExpired) as error:
         startup_error = str(error)
     while not stopped.is_set():
@@ -694,7 +707,7 @@ class FleetConsole:
         workbench = self.workbench
         active_ips = set(workbench.active_identities)
         if workbench.signature:
-            active_ips.update(row[0] for row in workbench.signature[4])
+            active_ips.update(row[0] for row in workbench.signature[-1])
             active_ips.add(workbench.signature[0])
         if addresses & active_ips:
             workbench.stop()

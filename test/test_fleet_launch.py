@@ -66,6 +66,14 @@ with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml') as custom:
     assert config.params['/ugv7/uwb_localizer/tag_height'].value == 0.33
 print('Custom anchor config reaches the real localizer launch.')
 
+config = resolve('five_ugv_uwb_localization', 'ugv.launch',
+                 ['ugv_id:=7', 'localization_mode:=linktrack', 'port_name:=/dev/test_uwb'])
+assert any(node.package == 'nlink_parser' and node.type == 'linktrack' for node in config.nodes)
+assert any(node.name == 'nlink_localizer' for node in config.nodes)
+assert not any(node.name == 'uwb_localizer' for node in config.nodes)
+assert config.params['/ugv7/linktrack0/port_name'].value == '/dev/test_uwb'
+print('LinkTrack localization mode reaches the formation pose adapter.')
+
 for robot, aux, expected in [('ugv2', '', 1), ('ugv3', '/dev/uwb_iot_aux', 2)]:
     config = resolve('nlink_parser', 'iot_monitor.launch',
                      ['robot_name:=' + robot, 'port_name:=/dev/uwb_iot', 'aux_port:=' + aux])

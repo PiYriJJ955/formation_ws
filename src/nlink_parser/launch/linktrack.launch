@@ -1,6 +1,8 @@
 <launch>
+    <arg name="port_name" default="/dev/ttyCH343USB2" />
+    <arg name="baud_rate" default="921600" />
     <node pkg="nlink_parser" type="linktrack" name="linktrack0" output="screen">
-        <param name="port_name" value="/dev/ttyCH343USB2" />
-        <param name="baud_rate" value="921600" />
+        <param name="port_name" value="$(arg port_name)" />
+        <param name="baud_rate" value="$(arg baud_rate)" />
     </node>
 </launch>
