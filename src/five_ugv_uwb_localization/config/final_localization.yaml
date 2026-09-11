@@ -6,24 +6,24 @@ anchors:
   y: 0.0
   z: 1.35
 - id: 4
-  x: 2.988
-  y: 0.142
+  x: 3.2
+  y: 0.0
   z: 1.35
 - id: 1
-  x: 6.263
-  y: 0.501
+  x: 6.4
+  y: 0.0
   z: 1.35
 - id: 2
-  x: 6.095
-  y: 4.651
+  x: 6.4
+  y: 4.4
   z: 1.35
 - id: 5
-  x: 3.086
-  y: 4.374
+  x: 3.2
+  y: 4.4
   z: 1.35
 - id: 3
   x: 0.0
-  y: 4.275
+  y: 4.4
   z: 1.35
 tag_offset_xy:
 - 0.0
@@ -55,9 +55,9 @@ valid_max_residual_rms: 0.6
 max_geometry_condition: 20.0
 max_position_correction: 0.06
 workspace_x_min: 0.0
-workspace_x_max: 6.263
+workspace_x_max: 6.4
 workspace_y_min: 0.0
-workspace_y_max: 4.651
+workspace_y_max: 4.4
 workspace_margin: 0.8
 input_watchdog_timeout: 0.2
 motion_timeout: 0.15
