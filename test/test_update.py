@@ -85,5 +85,9 @@ with tempfile.TemporaryDirectory(prefix='formation-update-') as directory:
     local_revision = run('git', 'rev-parse', 'HEAD', cwd=robot).stdout
     assert run('bash', 'scripts/update.sh', cwd=robot, ok=False).returncode != 0
     assert run('git', 'rev-parse', 'HEAD', cwd=robot).stdout == local_revision
+    result = run('bash', 'scripts/update.sh', '--discard-local-changes', cwd=robot)
+    assert 'Local commits replaced by server master' in result.stdout, result.stdout
+    assert (robot / 'version').read_text() == 'two\n'
+    assert run('git', 'rev-parse', 'HEAD', cwd=robot).stdout == run('git', 'rev-parse', 'origin/master', cwd=robot).stdout
 
-print('Update checks passed: dirty files, running ROS, failed build retry, branches and local commits.')
+print('Update checks passed: dirty files, running ROS, failed build retry, branches and local commit replacement.')

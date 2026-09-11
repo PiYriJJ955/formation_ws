@@ -20,7 +20,15 @@ if pgrep -f '(^|/)(roslaunch|roscore|rosmaster)( |$)|wheeltec_robot_node|displac
     exit 0
 fi
 [[ "$(git symbolic-ref --short HEAD)" == master ]] || { echo 'Expected master branch.' >&2; exit 1; }
-git merge-base --is-ancestor HEAD origin/master || { echo 'Local commits are not on the server; update stopped.' >&2; exit 1; }
+if ! git merge-base --is-ancestor HEAD origin/master; then
+    if [[ "$discard_local_changes" == true ]]; then
+        echo 'Local commits replaced by server master (--discard-local-changes).'
+        git reset --hard origin/master
+    else
+        echo 'Local commits are not on the server; update stopped.' >&2
+        exit 1
+    fi
+fi
 if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
     if [[ "$discard_local_changes" == true ]]; then
         git reset --hard HEAD
