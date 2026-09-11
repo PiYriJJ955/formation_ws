@@ -18,7 +18,7 @@ range_stddevs: {}
 gyro_bias_z: 0.0
 min_anchors: 4
 min_valid_range: 1.05
-max_valid_range: 3
+max_valid_range: 6.5
 
 # Fixed standard deviations; robust weights only limit individual innovations.
 range_sigma: 0.20
