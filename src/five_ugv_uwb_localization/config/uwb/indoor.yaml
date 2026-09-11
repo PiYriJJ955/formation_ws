@@ -1,5 +1,6 @@
 # 内场基站配置的初始副本；坐标可在控制台中按现场测量值修改。
 tag_height: 0.25
+valid_max_residual_rms: 0.6
 anchors:
   - {id: 0, x: 0.0, y: 0.0, z: 1.35}
   - {id: 4, x: 3.2, y: 0.0, z: 1.35}

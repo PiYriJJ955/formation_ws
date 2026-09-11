@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 
 import paramiko
 from fleet_deploy import (read_robot_config, sync_workspace, update_master, update_identity,
-                          robot_number, grant_serial_permissions)
+                          robot_number, grant_serial_permissions, shell_path)
 from fleet_workbench import DEFAULTS as WORKBENCH_DEFAULTS
 from git_http_server import PASSWORD_FILE, server_info, local_git_urls
 
@@ -383,7 +383,16 @@ class RobotSession:
             with self.client.open_sftp() as sftp:
                 sftp.put(str(Path(__file__).with_name('fleet_bridge.py')), remote)
                 sftp.chmod(remote, 0o600)
-            command = ('set -e; source %s; trap %s EXIT; python -u %s' % (
+                workspace = self.options['workspace'].rstrip('/')
+                home = sftp.normalize('.')
+                if workspace.startswith('~/'):
+                    workspace = home + workspace[1:]
+                sftp.put(str(Path(__file__).resolve().parents[1] / 'fix_python_permissions.sh'),
+                         workspace + '/fix_python_permissions.sh')
+                sftp.chmod(workspace + '/fix_python_permissions.sh', 0o755)
+            permissions = shell_path(self.options['workspace'].rstrip('/') + '/fix_python_permissions.sh')
+            command = ('set -e; bash %s; source %s; trap %s EXIT; python -u %s' % (
+                permissions,
                 workspace_setup(self.options['workspace']),
                 shlex.quote('rm -f ' + shlex.quote(remote)), shlex.quote(remote)))
             channel = self.client.get_transport().open_session(timeout=5)
@@ -612,7 +621,7 @@ class FleetConsole:
         self.vehicle_menu = tk.Menu(root, tearoff=False)
         for table in (self.table, self.workbench.vehicles):
             table.bind('<Button-3>', self.show_vehicle_menu)
-        self.notebook.select(max(0, min(3, int(self.vars['active_tab'].get()))))
+        self.notebook.select(max(0, min(4, int(self.vars['active_tab'].get()))))
         def tab_changed(_):
             self.stop_motion()
             self.workbench.armed.set(False)

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import queue
 import shlex
+import subprocess
 import stat
 import threading
 import time
@@ -164,6 +165,40 @@ def save_localization_file(text, path=None):
     return config
 
 
+def save_anchor_profile(profile, config):
+    """Write the selected profile and mirror its anchor fields in the base file."""
+    if profile not in ANCHOR_PROFILES:
+        raise ValueError('UWB 基站配置不存在')
+    validate_localization_config(config)
+    profile_path = PROFILE_DIR / (profile + '.yaml')
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        'tag_height': config['tag_height'],
+        'valid_max_residual_rms': config['valid_max_residual_rms'],
+        'anchors': config['anchors'],
+    }
+    fd, temporary = tempfile.mkstemp(prefix='.uwb-profile-', dir=str(profile_path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            yaml.safe_dump(payload, stream, allow_unicode=True, sort_keys=False)
+        if profile_path.exists():
+            os.chmod(temporary, stat.S_IMODE(profile_path.stat().st_mode))
+        os.replace(temporary, profile_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+    # Keep final_localization.yaml useful as the repository fallback as well.
+    base = yaml.safe_load(FINAL_LOCALIZATION.read_text(encoding='utf-8')) or {}
+    base.update({key: payload[key] for key in ('anchors', 'tag_height', 'valid_max_residual_rms')})
+    anchors = payload['anchors']
+    base.update(workspace_x_min=min(a['x'] for a in anchors), workspace_x_max=max(a['x'] for a in anchors),
+                workspace_y_min=min(a['y'] for a in anchors), workspace_y_max=max(a['y'] for a in anchors))
+    save_localization_file(yaml.safe_dump(base, allow_unicode=True, sort_keys=False), FINAL_LOCALIZATION)
+    localization_config.cache_clear()
+    return payload
+
+
 @lru_cache(maxsize=32)
 def localization_config(encoded='', profile='outdoor'):
     if profile not in ANCHOR_PROFILES:
@@ -200,13 +235,18 @@ def formation_algorithm(options):
     return value
 
 
+def permissions_command(options):
+    script = shell_path(options['workspace'].rstrip('/') + '/fix_python_permissions.sh')
+    return 'bash %s; ' % script
+
+
 def launch_command(step, options, ip, name, remote, row=None):
     number = robot_number(name)
     helper = 'python -u %s/fleet_ros.py' % shlex.quote(remote)
     if step == 'master':
         command = 'exec roscore'
     elif step == 'chassis':
-        command = ('%s check --step chassis --localization-mode %s --ids %d; '
+        command = (permissions_command(options) + '%s check --step chassis --localization-mode %s --ids %d; '
                    'exec flock -n "$HOME/.cache/formation-console/chassis.lock" '
                    'roslaunch %s/ugv.launch ugv_id:=%d car_mode:=mini_4wd localization_mode:=%s '
                    'localization_config:=%s/localization.yaml' %
@@ -218,7 +258,7 @@ def launch_command(step, options, ip, name, remote, row=None):
         if number == leader:
             raise ValueError('领航车不启动跟随控制器')
         package = formation_algorithm(options)
-        command = ('%s check --step follower --ids %d --formation-algorithm %s; exec flock -n "$HOME/.cache/formation-console/follower.lock" '
+        command = (permissions_command(options) + '%s check --step follower --ids %d --formation-algorithm %s; exec flock -n "$HOME/.cache/formation-console/follower.lock" '
                    'roslaunch %s follower.launch ugv_id:=%d leader_id:=%d auto_enable:=false '
                    'max_linear:=%s data_timeout:=%s' %
                    (helper, number, package, package, number, leader,
@@ -478,10 +518,28 @@ class FleetWorkbench:
         dialog.transient(self.root)
         text = self.tk.Text(dialog, wrap='word', padx=12, pady=12)
         text.pack(fill='both', expand=True)
-        text.insert('end', '\n\n'.join('%s  %s\n%s' % (self.app.robots.get(ip, {}).get('name', ''), ip, value)
-                                    for ip, value in results.items()))
+        report = '\n\n'.join('%s  %s\n%s' % (self.app.robots.get(ip, {}).get('name', ''), ip, value)
+                             for ip, value in results.items())
+        text.insert('end', report)
         text.configure(state='disabled')
-        self.ttk.Button(dialog, text='关闭', command=dialog.destroy).pack(pady=8)
+        text.focus_set()
+        def copy_report():
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(report)
+                self.root.update_idletasks()
+                self.status.set('启动结果已复制')
+            except self.tk.TclError as error:
+                self.status.set('复制失败：' + str(error))
+        def copy_event(_):
+            copy_report()
+            return 'break'
+        text.bind('<Control-c>', copy_event)
+        text.bind('<Command-c>', copy_event)
+        buttons = self.ttk.Frame(dialog)
+        buttons.pack(pady=8)
+        self.ttk.Button(buttons, text='复制全部', command=copy_report).pack(side='left', padx=5)
+        self.ttk.Button(buttons, text='关闭', command=dialog.destroy).pack(side='left', padx=5)
 
     def sync(self):
         try:
@@ -567,6 +625,13 @@ class FleetWorkbench:
         except Exception as error:
             self.app.messagebox.showerror('启动设置', str(error))
             return
+        if step in ('all', 'chassis', 'follower'):
+            try:
+                subprocess.run([str(ROOT / 'fix_python_permissions.sh')], check=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            except (OSError, subprocess.CalledProcessError) as error:
+                self.app.messagebox.showerror('启动设置', '修复 ROS Python 权限失败：%s' % error)
+                return
         self.app.cancel_scan()
         self.app.vars['auto_start'].set(False)
         self.app.stop_motion()
@@ -576,6 +641,7 @@ class FleetWorkbench:
             session.bridge_stop.set()
         self.cancel = threading.Event()
         self.signature = signature
+        self._stage_options = options
         self.status.set('正在启动：' + step)
         self.app.save()
         self.worker = threading.Thread(target=self.run_start, args=(step, options, rows, config), daemon=True)
@@ -586,12 +652,20 @@ class FleetWorkbench:
         return connect_ssh(ip, options, self.app.config_path.with_name('known_hosts'))
 
     def stage(self, client, config):
+        options = getattr(self, '_stage_options', None) or self.app.current_options()
         with client.open_sftp() as sftp:
             home = sftp.normalize('.')
             remote = home + '/.cache/formation-console/' + self.run_id
-            # mkdir through SSH handles missing parent cache directories.
+            workspace = options['workspace'].rstrip('/')
+            if workspace.startswith('~/'):
+                workspace = home + workspace[1:]
+        # mkdir through SSH handles missing parent cache directories.
         run_remote(client, 'mkdir -p ' + shlex.quote(remote), self.cancel, timeout=10)
+        run_remote(client, 'mkdir -p ' + shlex.quote(workspace), self.cancel, timeout=10)
         with client.open_sftp() as sftp:
+            # Keep startup self-contained even when the vehicle has not pulled the newest commit yet.
+            sftp.put(str(ROOT / 'fix_python_permissions.sh'), workspace + '/fix_python_permissions.sh')
+            sftp.chmod(workspace + '/fix_python_permissions.sh', 0o755)
             for name in ('fleet_ros.py', 'fleet_bridge.py', 'leader_tracker.py'):
                 sftp.put(str(Path(__file__).with_name(name)), remote + '/' + name)
             for name in ('ugv.launch', 'ugv_deploy.launch'):
@@ -648,7 +722,8 @@ class FleetWorkbench:
                     existing = configs[ip] = update_config(client, values)
                     self.events.put(('config', ip, existing))
                 remote = remotes[ip] = self.stage(client, config)
-                results[ip] = '配置已检查，启动文件已上传' if step in ('all', 'config') else '启动文件已上传'
+                results[ip] = ('配置已检查，基站配置和启动文件已上传'
+                               if step in ('all', 'config') else '基站配置和启动文件已上传')
                 self.events.put(('state', ip, results[ip]))
             if step == 'config':
                 self.events.put(('done', '配置检查完成；可继续启动 Master。', results))
@@ -1363,12 +1438,20 @@ class FleetWorkbench:
         self.metrics = self.tk.StringVar(value='三角形：基站　圆点：车辆　十字：跟踪目标　虚线：位置误差　灰色：定位无效 / 数据过期')
         self.ttk.Label(page, textvariable=self.metrics, wraplength=1080).pack(fill='x', pady=6)
         self.make_parameter_page()
+        self.make_iot_extract_page()
+
+    def make_iot_extract_page(self):
+        page = self.ttk.Frame(self.app.notebook, padding=10)
+        self.app.notebook.add(page, text='IOT 数据提取')
+        self.iot_extract_page = page
+        from fleet_iot import IotExtractPage
+        self.iot_extract = IotExtractPage(self, page)
 
     def make_parameter_page(self):
         page = self.ttk.Frame(self.app.notebook, padding=10)
         self.app.notebook.add(page, text='参数调整')
         self.parameters_page = page
-        self.ttk.Label(page, text='直接编辑主机仓库中的 final_localization.yaml；保存后请手动提交并 Git 同步各车。',
+        self.ttk.Label(page, text='直接编辑主机仓库中的 final_localization.yaml；保存会同步当前 UWB 档案，之后提交并 Git 同步各车。',
                        wraplength=1080).pack(anchor='w')
         toolbar = self.ttk.Frame(page)
         toolbar.pack(fill='x', pady=6)
@@ -1403,18 +1486,16 @@ class FleetWorkbench:
     def save_localization_file(self):
         try:
             config = save_localization_file(self.parameter_editor.get('1.0', 'end-1c'))
+            save_anchor_profile(self.app.vars['anchor_profile'].get(), config)
         except (OSError, ValueError) as error:
             self.app.messagebox.showerror('保存定位参数', str(error), parent=self.parameters_page)
             return
         self.parameter_editor.edit_modified(False)
-        # Keep the currently selected map profile in step with the base file for this session.
-        self.app.vars['anchors_json'].set(json.dumps(dict(
-            anchors=config['anchors'], tag_height=config['tag_height'],
-            valid_max_residual_rms=config['valid_max_residual_rms'])))
+        self.clear_anchor_override(self.app.vars['anchor_profile'].get())
         self.app.save()
         self.clear_trails()
-        self.parameter_status.set('已保存 final_localization.yaml；请手动 git commit / push 后同步各车')
-        self.map_status.set('基础定位参数已更新；当前档案已采用新基站；正在运行的定位节点需停止后重启才会读取')
+        self.parameter_status.set('已保存 final_localization.yaml 和当前 UWB 档案；请 git commit / push 后同步各车')
+        self.map_status.set('定位参数已更新；当前档案采用新基站；运行中的定位节点需停止后重启')
         self.paint_map(time.monotonic())
 
     def clear_trails(self):
@@ -1482,10 +1563,20 @@ class FleetWorkbench:
                 encoded = '' if reset else json.dumps(dict(
                     anchors=anchors, tag_height=float(height.get()),
                     valid_max_residual_rms=float(residual_limit.get())))
-                localization_config(encoded, self.app.vars['anchor_profile'].get())
-                self.app.vars['anchors_json'].set(encoded)
+                profile = self.app.vars['anchor_profile'].get()
+                config = localization_config(encoded, profile)
+                if not reset:
+                    save_anchor_profile(profile, config)
+                    self.clear_anchor_override(profile)
+                else:
+                    self.app.vars['anchors_json'].set('')
                 self.app.save()
                 self.clear_trails()
+                self.map_status.set(
+                    ('已清除当前会话覆盖，重新读取 %s 档案；运行中的定位需重启' %
+                     ANCHOR_PROFILES.get(profile, profile)) if reset else
+                    ('%s 档案已写入仓库 YAML；Git 同步后车端更新，运行中的定位需重启' %
+                     ANCHOR_PROFILES.get(profile, profile)))
                 dialog.destroy()
             except ValueError as error:
                 self.app.messagebox.showerror('基站配置有误', str(error), parent=dialog)
@@ -1493,6 +1584,13 @@ class FleetWorkbench:
         bottom.pack(pady=6)
         self.ttk.Button(bottom, text='保存基站设置', command=save).pack(side='left', padx=8)
         self.ttk.Button(bottom, text='恢复所选档案默认值', command=lambda: save(True)).pack(side='left')
+        dialog.anchor_save, dialog.anchor_reset = save, lambda: save(True)
+
+    def clear_anchor_override(self, profile):
+        overrides = json.loads(self.app.vars['anchor_overrides_json'].get())
+        overrides[profile] = ''
+        self.app.vars['anchors_json'].set('')
+        self.app.vars['anchor_overrides_json'].set(json.dumps(overrides))
 
     def select_formation_algorithm(self, _=None):
         if self.active():
@@ -1645,6 +1743,8 @@ class FleetWorkbench:
         self.metrics.set('\n'.join(metrics) if metrics else '暂无实时误差数据。领航航向对齐到 UWB 地图；跟随车航向以连接时的朝向为 +X 参考。')
 
     def poll(self):
+        if getattr(self, 'iot_extract', None):
+            self.iot_extract.poll()
         if self.monitor:
             self.monitor.ui_heartbeat = time.monotonic()
         for _ in range(200):
@@ -1759,6 +1859,8 @@ class FleetWorkbench:
     def close(self):
         if self.iot_window and not self.iot_window.closed:
             self.iot_window.close()
+        if getattr(self, 'iot_extract', None):
+            self.iot_extract.close()
         for session in self.iot_sessions + self.iot_probes:
             session.stop.set()
         self.stop()

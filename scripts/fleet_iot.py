@@ -6,6 +6,8 @@ import math
 from pathlib import Path
 import queue
 import shlex
+import shutil
+import stat
 import threading
 import time
 import uuid
@@ -466,3 +468,203 @@ class IotWindow:
                     dot = '#d32f2f' if component == 2 and abs(value) > 50 else color
                     canvas.create_oval(x-1.5, yy-1.5, x+1.5, yy+1.5, fill=dot, outline='')
                     previous = stamp, x, yy
+
+
+def download_iot_logs(client, workspace, destination):
+    """Download the vehicle's recorded IOT directory and return local files."""
+    destination = Path(destination)
+    with client.open_sftp() as sftp:
+        home = sftp.normalize('.')
+        root = home + workspace[1:] if workspace.startswith('~/') else workspace
+        root = root.rstrip('/') + '/logs/uwb_iot'
+        try:
+            sftp.stat(root)
+        except IOError as error:
+            raise RuntimeError('车端没有 IOT 数据目录：%s' % root) from error
+        files = []
+
+        def walk(remote, relative):
+            for entry in sftp.listdir_attr(remote):
+                name = entry.filename
+                if name in ('.', '..') or '/' in name:
+                    continue
+                child = remote.rstrip('/') + '/' + name
+                rel = relative / name
+                if stat.S_ISDIR(entry.st_mode):
+                    walk(child, rel)
+                elif stat.S_ISREG(entry.st_mode):
+                    local = destination / rel
+                    local.parent.mkdir(parents=True, exist_ok=True)
+                    sftp.get(child, str(local))
+                    files.append(local)
+
+        walk(root, Path())
+    return files
+
+
+class IotExtractPage:
+    """Vehicle list for downloading recorded IOT data from each workspace."""
+    def __init__(self, workbench, page):
+        self.workbench, self.app, self.tk, self.ttk = workbench, workbench.app, workbench.tk, workbench.ttk
+        self.page = page
+        self.events, self.files, self.states = queue.Queue(), {}, {}
+        self.destination = Path(__file__).resolve().parents[1] / 'logs/uwb_iot' / (
+            'extracted_' + datetime.now().strftime('%Y%m%d_%H%M%S'))
+        self.ttk.Label(page, text='从车端工作空间 logs/uwb_iot 提取已保存的 IOT 数据；可按车查看并下载到本机。',
+                       wraplength=1080).pack(anchor='w')
+        toolbar = self.ttk.Frame(page)
+        toolbar.pack(fill='x', pady=6)
+        self.ttk.Button(toolbar, text='一键提取全部车辆', command=self.extract_all).pack(side='left')
+        self.ttk.Button(toolbar, text='提取选中车辆', command=self.extract_selected).pack(side='left', padx=6)
+        self.ttk.Button(toolbar, text='查看选中车辆', command=self.show_selected).pack(side='left')
+        self.ttk.Button(toolbar, text='下载选中文件', command=self.download_selected).pack(side='left', padx=6)
+        self.status = self.tk.StringVar(value='请选择车辆，或点击“一键提取全部车辆”。')
+        self.ttk.Label(page, textvariable=self.status, wraplength=1080).pack(fill='x')
+        self.ttk.Label(page, text='本机保存目录：' + str(self.destination), wraplength=1080).pack(anchor='w')
+        panes = self.ttk.Panedwindow(page, orient='horizontal')
+        panes.pack(fill='both', expand=True, pady=8)
+        left, right = self.ttk.Frame(panes), self.ttk.Frame(panes)
+        panes.add(left, weight=1)
+        panes.add(right, weight=2)
+        self.vehicles = self.ttk.Treeview(left, columns=('ip', 'name', 'state'), show='headings',
+                                          selectmode='extended')
+        for key, title, width in [('ip', 'IP', 145), ('name', '车辆', 80), ('state', '状态', 150)]:
+            self.vehicles.heading(key, text=title)
+            self.vehicles.column(key, width=width, minwidth=60, stretch=key == 'state')
+        self.vehicles.pack(fill='both', expand=True)
+        self.vehicles.bind('<<TreeviewSelect>>', lambda _: self.show_selected())
+        self.files_view = self.ttk.Treeview(right, columns=('path', 'size'), show='headings', selectmode='browse')
+        self.files_view.heading('path', text='本地文件')
+        self.files_view.heading('size', text='大小')
+        self.files_view.column('path', width=520, stretch=True)
+        self.files_view.column('size', width=100, stretch=False)
+        self.files_view.pack(fill='both', expand=True)
+        self.files_view.bind('<Double-1>', lambda _: self.view_selected_file())
+        self._refresh_vehicles()
+        self.timer = None
+
+    def close(self):
+        self.timer = None
+
+    def _refresh_vehicles(self):
+        known = {ip for ip, row in self.app.robots.items() if row.get('robot_id')}
+        for ip in self.vehicles.get_children():
+            if ip not in known:
+                self.vehicles.delete(ip)
+        for ip, row in self.app.robots.items():
+            if not row.get('robot_id'):
+                continue
+            self.states.setdefault(ip, '未提取')
+            values = (ip, row.get('robot_id', ''), self.states[ip])
+            if self.vehicles.exists(ip):
+                self.vehicles.item(ip, values=values)
+            else:
+                self.vehicles.insert('', 'end', iid=ip, values=values)
+
+    def _selected(self):
+        return [ip for ip in self.vehicles.selection() if ip in self.app.robots]
+
+    def extract_all(self):
+        self.extract(list(self.vehicles.get_children()))
+
+    def extract_selected(self):
+        selected = self._selected()
+        if not selected:
+            self.status.set('请先选择车辆')
+            return
+        self.extract(selected)
+
+    def extract(self, addresses):
+        options = self.app.current_options()
+        self.destination.mkdir(parents=True, exist_ok=True)
+        for ip in addresses:
+            if self.states.get(ip) == '提取中':
+                continue
+            self.states[ip] = '提取中'
+            threading.Thread(target=self._extract_one, args=(ip, options), daemon=True).start()
+        self._refresh_vehicles()
+        self.status.set('正在提取 %d 辆车的数据；完成后可在右侧查看文件。' % len(addresses))
+
+    def _extract_one(self, ip, options):
+        client = None
+        try:
+            client = self.workbench.connect(ip, options)
+            robot = self.app.robots[ip].get('robot_id') or ip
+            files = download_iot_logs(client, options['workspace'], self.destination / robot)
+            self.events.put((ip, 'done', files))
+        except Exception as error:
+            self.events.put((ip, 'error', str(error)))
+        finally:
+            if client:
+                client.close()
+
+    def show_selected(self):
+        selected = self._selected()
+        if len(selected) != 1:
+            return
+        self.files_view.delete(*self.files_view.get_children())
+        for index, path in enumerate(self.files.get(selected[0], ())):
+            path = Path(path)
+            try:
+                size = '%d KB' % max(1, path.stat().st_size // 1024)
+            except OSError:
+                size = '—'
+            self.files_view.insert('', 'end', iid=str(index), values=(str(path), size))
+
+    def selected_file(self):
+        selected = self.files_view.selection()
+        if not selected:
+            return None
+        value = self.files_view.item(selected[0], 'values')
+        return Path(value[0]) if value else None
+
+    def view_selected_file(self):
+        path = self.selected_file()
+        if not path:
+            return
+        try:
+            text = path.read_text(encoding='utf-8', errors='replace')[:500000]
+        except OSError as error:
+            self.status.set('读取文件失败：' + str(error))
+            return
+        dialog = self.tk.Toplevel(self.workbench.root)
+        dialog.title('IOT 数据 · ' + path.name)
+        editor = self.tk.Text(dialog, wrap='none', padx=10, pady=10)
+        editor.pack(fill='both', expand=True)
+        editor.insert('1.0', text)
+        editor.configure(state='disabled')
+        self.ttk.Button(dialog, text='关闭', command=dialog.destroy).pack(pady=6)
+
+    def download_selected(self):
+        path = self.selected_file()
+        if not path:
+            self.status.set('请先在右侧选择文件')
+            return
+        from tkinter import filedialog
+        target = filedialog.asksaveasfilename(parent=self.workbench.root, initialfile=path.name,
+                                              title='下载 IOT 文件')
+        if target:
+            try:
+                shutil.copy2(path, target)
+                self.status.set('已下载：' + target)
+            except OSError as error:
+                self.status.set('下载失败：' + str(error))
+
+    def poll(self):
+        self._refresh_vehicles()
+        changed = False
+        while True:
+            try:
+                ip, event, value = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if event == 'done':
+                self.files[ip] = value
+                self.states[ip] = '已提取 %d 个文件' % len(value)
+            else:
+                self.states[ip] = '失败：' + value
+            changed = True
+            self._refresh_vehicles()
+            self.show_selected()
+        if changed and self.states and not any(value == '提取中' for value in self.states.values()):
+            self.status.set('提取完成；请选择车辆查看文件，双击文件可查看内容。')
