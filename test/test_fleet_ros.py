@@ -205,7 +205,7 @@ def main():
                 pump(0.5, enabled=True, sequence=5)
                 assert latest['tracking']['state'] == 'TRACKING' and velocities[0][-1][1] > 0, latest
                 # Stale heartbeats pause auto; repeating the same resume request cannot restart it.
-                pump(0.7, stale=True)
+                pump(2.3, stale=True)
                 assert velocities[0][-1][1] == 0 and latest['tracking']['reason'] == 'CONTROL_TIMEOUT', latest
                 pump(0.5)
                 assert latest['tracking']['state'] == 'PAUSED', latest

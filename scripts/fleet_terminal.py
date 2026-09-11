@@ -176,6 +176,9 @@ def main():
             status(state='SSH 已连接')
         channel.invoke_shell()
         resize()
+        # Make the interactive prompt use the same vehicle environment as the
+        # launch commands (ROS_MASTER_URI, ROS_IP, and rostopic in PATH).
+        channel.sendall(b'source ~/formation_ws/scripts/env.sh\n')
         relay(channel)
     except Exception as error:
         status(state='失败', error=str(error))
