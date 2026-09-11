@@ -315,6 +315,21 @@ class ConsoleChecks(unittest.TestCase):
                 self.assertEqual(app.git_status.get(), 'Git server：测试状态')
                 self.assertEqual(str(app.git_status_label.cget('foreground')), '#267346' if running else '#b52b33')
             self.assertIs(app.git_status_label.master, root)
+            app.git_urls = ['http://192.168.0.117:8000/formation.git']
+            app.git_authentication = 'password'
+            password_file = Path(directory) / 'git-password'
+            password_file.write_text('copy-me')
+            with patch('fleet_console.PASSWORD_FILE', password_file):
+                app.show_git_connection()
+            dialog = next(widget for widget in root.winfo_children() if widget.winfo_class() == 'Toplevel')
+            buttons = {widget.cget('text'): widget for widget in dialog.winfo_children()
+                       if widget.winfo_class() == 'TFrame'
+                       for widget in widget.winfo_children() if widget.winfo_class() == 'TButton'}
+            for title, expected in [('复制地址', app.git_urls[0]), ('复制用户名', 'formation'), ('复制密码', 'copy-me')]:
+                buttons[title].invoke()
+                root.update_idletasks()
+                self.assertEqual(root.clipboard_get(), expected)
+            dialog.destroy()
             commands = {}
             actions = []
 

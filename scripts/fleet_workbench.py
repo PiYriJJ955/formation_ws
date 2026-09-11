@@ -5,11 +5,14 @@ from functools import lru_cache
 import ipaddress
 import json
 import math
+import os
 from pathlib import Path
 import queue
 import shlex
+import stat
 import threading
 import time
+import tempfile
 import uuid
 from xml.sax.saxutils import escape
 
@@ -22,6 +25,7 @@ from leader_tracker import parse_points, check_bounds, curve_point, sample_path
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCALIZATION = ROOT / 'src/five_ugv_uwb_localization'
+FINAL_LOCALIZATION = LOCALIZATION / 'config/final_localization.yaml'
 PROFILE_DIR = LOCALIZATION / 'config/uwb'
 ANCHOR_PROFILES = {'outdoor': '外场', 'indoor': '内场'}
 LOCALIZATION_MODES = ('five_ugv', 'linktrack')
@@ -96,38 +100,85 @@ def saved_data_timeout(options):
     return value
 
 
+def validate_localization_config(config):
+    """Validate the fields required by the runtime localization node."""
+    if not isinstance(config, dict):
+        raise ValueError('定位配置必须是 YAML 对象')
+    try:
+        anchors = config['anchors']
+        min_anchors = config['min_anchors']
+        tag_height = config['tag_height']
+        residual_limit = config['valid_max_residual_rms']
+    except KeyError as error:
+        raise ValueError('定位配置缺少参数：%s' % error.args[0])
+    if not isinstance(anchors, list):
+        raise ValueError('基站配置必须是列表')
+    if isinstance(min_anchors, bool) or not isinstance(min_anchors, int) or min_anchors < 1:
+        raise ValueError('最少基站数必须是正整数')
+    if len(anchors) < min_anchors:
+        raise ValueError('定位至少需要 %d 个基站' % min_anchors)
+    ids = []
+    for anchor in anchors:
+        if not isinstance(anchor, dict) or any(key not in anchor for key in ('id', 'x', 'y', 'z')):
+            raise ValueError('每个基站必须包含 id、x、y、z')
+        ids.append(anchor['id'])
+    if any(type(value) is not int or not 0 <= value <= 255 for value in ids) or len(set(ids)) != len(ids):
+        raise ValueError('基站 ID 必须是 0–255 的不重复整数')
+    values = [tag_height] + [anchor[key] for anchor in anchors for key in ('x', 'y', 'z')]
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+           for value in values):
+        raise ValueError('坐标和高度必须是有限数值，单位米')
+    if tag_height < 0 or any(anchor['z'] < 0 for anchor in anchors):
+        raise ValueError('高度不能小于零')
+    if (isinstance(residual_limit, bool) or not isinstance(residual_limit, (int, float)) or
+            not math.isfinite(residual_limit) or residual_limit <= 0):
+        raise ValueError('有效残差阈值必须是大于 0 的有限数值（米）')
+    first = anchors[0]
+    if not any(abs((b['x'] - first['x']) * (c['y'] - first['y']) -
+                   (b['y'] - first['y']) * (c['x'] - first['x'])) > 1e-5
+               for b in anchors for c in anchors):
+        raise ValueError('基站在 XY 平面不能全部共线')
+    return config
+
+
+def save_localization_file(text, path=None):
+    """Validate and atomically save the repository's base localization YAML."""
+    try:
+        config = yaml.safe_load(text)
+    except yaml.YAMLError as error:
+        raise ValueError('YAML 格式错误：%s' % error)
+    validate_localization_config(config)
+    path = Path(path or FINAL_LOCALIZATION)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.final-localization-', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(text.rstrip() + '\n')
+        if path.exists():
+            os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    localization_config.cache_clear()
+    return config
+
+
 @lru_cache(maxsize=32)
 def localization_config(encoded='', profile='outdoor'):
     if profile not in ANCHOR_PROFILES:
         profile = 'outdoor'
-    base = yaml.safe_load((LOCALIZATION / 'config/final_localization.yaml').read_text())
+    base = yaml.safe_load(FINAL_LOCALIZATION.read_text(encoding='utf-8'))
     path = PROFILE_DIR / (profile + '.yaml')
     if path.exists():
-        base.update(yaml.safe_load(path.read_text()) or {})
+        base.update(yaml.safe_load(path.read_text(encoding='utf-8')) or {})
     if encoded:
         custom = json.loads(encoded)
         base.update(anchors=custom['anchors'], tag_height=custom['tag_height'])
         if 'valid_max_residual_rms' in custom:
             base['valid_max_residual_rms'] = custom['valid_max_residual_rms']
+    validate_localization_config(base)
     anchors = base['anchors']
-    if len(anchors) < base['min_anchors']:
-        raise ValueError('定位至少需要 %d 个基站' % base['min_anchors'])
-    ids = [a['id'] for a in anchors]
-    if any(type(value) is not int or not 0 <= value <= 255 for value in ids) or len(set(ids)) != len(ids):
-        raise ValueError('基站 ID 必须是 0–255 的不重复整数')
-    for value in [base['tag_height']] + [a[key] for a in anchors for key in ('x', 'y', 'z')]:
-        if not isinstance(value, (int, float)) or not math.isfinite(value):
-            raise ValueError('坐标和高度必须是有限数值，单位米')
-    if base['tag_height'] < 0 or any(a['z'] < 0 for a in anchors):
-        raise ValueError('高度不能小于零')
-    residual_limit = base['valid_max_residual_rms']
-    if (isinstance(residual_limit, bool) or not isinstance(residual_limit, (int, float)) or
-            not math.isfinite(residual_limit) or residual_limit <= 0):
-        raise ValueError('有效残差阈值必须是大于 0 的有限数值（米）')
-    a = anchors[0]
-    if not any(abs((b['x'] - a['x']) * (c['y'] - a['y']) -
-                   (b['y'] - a['y']) * (c['x'] - a['x'])) > 1e-5 for b in anchors for c in anchors):
-        raise ValueError('基站在 XY 平面不能全部共线')
     base.update(workspace_x_min=min(a['x'] for a in anchors), workspace_x_max=max(a['x'] for a in anchors),
                 workspace_y_min=min(a['y'] for a in anchors), workspace_y_max=max(a['y'] for a in anchors))
     return base
@@ -299,7 +350,8 @@ class FleetWorkbench:
         toolbar = self.ttk.Frame(page)
         toolbar.pack(fill='x')
         for title, action in [('快捷总启动', lambda: self.start('all')), ('停止本次启动', self.stop),
-                              ('立即同步 Git 仓库', self.sync), ('所有小车串口权限（777）', self.serial_permissions),
+                              ('立即同步 Git 仓库（丢弃车端修改）', self.sync),
+                              ('所有小车串口权限（777）', self.serial_permissions),
                               ('打开选中 SSH 终端', self.open_ssh)]:
             self.ttk.Button(toolbar, text=title, command=action).pack(side='left', padx=(0, 7))
         self.ttk.Label(toolbar, text='领航车').pack(side='left', padx=(8, 4))
@@ -589,7 +641,7 @@ class FleetWorkbench:
                 if step in ('all', 'config') and ip in rows:
                     existing = read_robot_config(client)
                     if not existing['robot_id']:
-                        raise RuntimeError('工作空间尚未安装，请先点击“立即同步 Git 仓库”')
+                        raise RuntimeError('工作空间尚未安装，请先点击“立即同步 Git 仓库（丢弃车端修改）”')
                     values = dict(UGV_ID=str(robot_number(rows[ip]['robot_id'])),
                                   ROS_MASTER_URI='http://%s:11311' % options['master_ip'], ROS_IP=ip, CAR_MODE='mini_4wd')
                     values.update(rows[ip].get('formation_config', {}))
@@ -1310,6 +1362,60 @@ class FleetWorkbench:
         self.ttk.Label(self.path_tools, textvariable=self.path_pick_status, wraplength=1080).pack(anchor='w', pady=4)
         self.metrics = self.tk.StringVar(value='三角形：基站　圆点：车辆　十字：跟踪目标　虚线：位置误差　灰色：定位无效 / 数据过期')
         self.ttk.Label(page, textvariable=self.metrics, wraplength=1080).pack(fill='x', pady=6)
+        self.make_parameter_page()
+
+    def make_parameter_page(self):
+        page = self.ttk.Frame(self.app.notebook, padding=10)
+        self.app.notebook.add(page, text='参数调整')
+        self.parameters_page = page
+        self.ttk.Label(page, text='直接编辑主机仓库中的 final_localization.yaml；保存后请手动提交并 Git 同步各车。',
+                       wraplength=1080).pack(anchor='w')
+        toolbar = self.ttk.Frame(page)
+        toolbar.pack(fill='x', pady=6)
+        self.ttk.Button(toolbar, text='重新加载文件', command=self.load_localization_file).pack(side='left')
+        self.ttk.Button(toolbar, text='保存到 final_localization.yaml',
+                        command=self.save_localization_file).pack(side='left', padx=8)
+        self.parameter_status = self.tk.StringVar(value=str(FINAL_LOCALIZATION))
+        self.ttk.Label(toolbar, textvariable=self.parameter_status).pack(side='left', padx=8)
+        editor_frame = self.ttk.Frame(page)
+        editor_frame.pack(fill='both', expand=True)
+        self.parameter_editor = self.tk.Text(editor_frame, wrap='none', undo=True,
+                                             font=('Monospace', 10), padx=8, pady=8)
+        vertical = self.ttk.Scrollbar(editor_frame, orient='vertical', command=self.parameter_editor.yview)
+        horizontal = self.ttk.Scrollbar(editor_frame, orient='horizontal', command=self.parameter_editor.xview)
+        self.parameter_editor.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        vertical.pack(side='right', fill='y')
+        horizontal.pack(side='bottom', fill='x')
+        self.parameter_editor.pack(side='left', fill='both', expand=True)
+        self.load_localization_file()
+
+    def load_localization_file(self):
+        try:
+            text = FINAL_LOCALIZATION.read_text(encoding='utf-8')
+        except OSError as error:
+            self.parameter_status.set('读取失败：' + str(error))
+            return
+        self.parameter_editor.delete('1.0', 'end')
+        self.parameter_editor.insert('1.0', text)
+        self.parameter_editor.edit_modified(False)
+        self.parameter_status.set('已加载 final_localization.yaml；修改后点击保存')
+
+    def save_localization_file(self):
+        try:
+            config = save_localization_file(self.parameter_editor.get('1.0', 'end-1c'))
+        except (OSError, ValueError) as error:
+            self.app.messagebox.showerror('保存定位参数', str(error), parent=self.parameters_page)
+            return
+        self.parameter_editor.edit_modified(False)
+        # Keep the currently selected map profile in step with the base file for this session.
+        self.app.vars['anchors_json'].set(json.dumps(dict(
+            anchors=config['anchors'], tag_height=config['tag_height'],
+            valid_max_residual_rms=config['valid_max_residual_rms'])))
+        self.app.save()
+        self.clear_trails()
+        self.parameter_status.set('已保存 final_localization.yaml；请手动 git commit / push 后同步各车')
+        self.map_status.set('基础定位参数已更新；当前档案已采用新基站；正在运行的定位节点需停止后重启才会读取')
+        self.paint_map(time.monotonic())
 
     def clear_trails(self):
         self.trails.clear()

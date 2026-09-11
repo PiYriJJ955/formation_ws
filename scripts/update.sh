@@ -24,10 +24,8 @@ git merge-base --is-ancestor HEAD origin/master || { echo 'Local commits are not
 if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
     if [[ "$discard_local_changes" == true ]]; then
         git reset --hard HEAD
-        [[ -z "$(git status --porcelain --untracked-files=normal)" ]] || {
-            echo 'Untracked files found; remove or move them before updating.' >&2
-            exit 1
-        }
+        # GUI sync is explicitly destructive: discard tracked and untracked workspace edits.
+        git clean -fd -e .local/
     else
         echo 'Local changes found; commit or move them before updating.' >&2
         exit 1

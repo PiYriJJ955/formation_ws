@@ -684,7 +684,7 @@ class WorkbenchChecks(unittest.TestCase):
                 self.assertEqual(monitor.limits, {str(n): 0.0 for n in range(1, 6)})
                 wb.monitor = None
                 self.assertEqual([app.notebook.tab(tab, 'text') for tab in app.notebook.tabs()],
-                                 ['扫描与连接', '编队算法', '小车定位图'])
+                                 ['扫描与连接', '编队算法', '小车定位图', '参数调整'])
                 page = root.nametowidget(app.notebook.tabs()[1])
                 steps = next(widget for widget in page.winfo_children() if isinstance(widget, ttk.Notebook))
                 self.assertEqual([steps.tab(tab, 'text') for tab in steps.tabs()],

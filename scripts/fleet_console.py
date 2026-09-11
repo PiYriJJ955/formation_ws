@@ -488,7 +488,7 @@ class FleetConsole:
         self.selected_rows = ()
         self.vars = {key: (tk.BooleanVar(value=value) if isinstance(value, bool)
                            else tk.StringVar(value=value)) for key, value in self.options.items()}
-        root.title('小车编队控制台 · mini_4wd')
+        root.title('编队控制台 - COSTA UGV Swarm')
         root.geometry(self.options['geometry'])
         root.minsize(1120, 780)
         style = ttk.Style(root)
@@ -538,7 +538,8 @@ class FleetConsole:
         ttk.Button(toolbar, text='导出列表 CSV', command=self.choose_export).pack(side='right')
         management = ttk.Frame(outer)
         management.pack(fill='x', pady=(0, 6))
-        ttk.Button(management, text='同步选中车辆', command=lambda: self.selected_action('sync')).pack(side='left')
+        ttk.Button(management, text='同步选中车辆（丢弃车端修改）',
+                   command=lambda: self.selected_action('sync')).pack(side='left')
         ttk.Label(management, text='编队 ROS Master IP').pack(side='left', padx=(12, 5))
         ttk.Entry(management, textvariable=self.vars['master_ip'], width=16).pack(side='left')
         ttk.Button(management, text='读取选中配置', command=lambda: self.selected_action('read')).pack(side='left', padx=5)
@@ -611,7 +612,7 @@ class FleetConsole:
         self.vehicle_menu = tk.Menu(root, tearoff=False)
         for table in (self.table, self.workbench.vehicles):
             table.bind('<Button-3>', self.show_vehicle_menu)
-        self.notebook.select(max(0, min(2, int(self.vars['active_tab'].get()))))
+        self.notebook.select(max(0, min(3, int(self.vars['active_tab'].get()))))
         def tab_changed(_):
             self.stop_motion()
             self.workbench.armed.set(False)
@@ -626,13 +627,14 @@ class FleetConsole:
         self.root.after(50, self.poll)
 
     def show_git_connection(self, _=None):
+        password = None
         credentials = '推送：免密码'
         if self.git_authentication != 'none':
             try:
                 password = PASSWORD_FILE.read_text().strip()
             except OSError:
-                password = '服务启动后可查看'
-            credentials = '推送用户名：formation\n推送密码：' + password
+                password = None
+            credentials = '推送用户名：formation\n推送密码：' + (password or '服务启动后可查看')
         dialog = self.tk.Toplevel(self.root)
         dialog.title('本机 Git server 连接信息')
         dialog.transient(self.root)
@@ -649,6 +651,28 @@ class FleetConsole:
                         '\n'.join(self.git_urls) or '等待本机网络地址；请确认已连接局域网。',
                         credentials, commands or '获取本机局域网地址后自动生成。'))
         text.configure(state='disabled')
+        def copy_value(value, label):
+            if not value:
+                return
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(value)
+                self.root.update_idletasks()
+                self.status.set('已复制 Git server ' + label)
+            except self.tk.TclError as error:
+                self.status.set('复制失败：' + str(error))
+        buttons = self.ttk.Frame(dialog)
+        buttons.pack(pady=(0, 6))
+        self.ttk.Button(buttons, text='复制地址',
+                        command=lambda: copy_value(self.git_urls[0] if self.git_urls else '', '地址')).pack(
+                            side='left', padx=4)
+        self.ttk.Button(buttons, text='复制用户名',
+                        command=lambda: copy_value('formation', '用户名')).pack(side='left', padx=4)
+        password_button = self.ttk.Button(buttons, text='复制密码',
+                                          command=lambda: copy_value(password, '密码'))
+        password_button.pack(side='left', padx=4)
+        if password is None:
+            password_button.state(['disabled'])
         self.ttk.Button(dialog, text='关闭', command=dialog.destroy).pack(pady=6)
 
     def entry(self, parent, label, key, row, col, width=16, span=1, **kwargs):
