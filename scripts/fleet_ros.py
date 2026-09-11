@@ -301,7 +301,7 @@ def main():
                         return
                     last_input = monotonic()
                     tick = command.get('tick', 0)
-                    fresh = isinstance(tick, (int, float)) and 0 <= monotonic() - tick <= 0.4
+                    fresh = isinstance(tick, (int, float)) and 0 <= monotonic() - tick <= 2.0
                     if fresh:
                         last_heartbeat = monotonic()
                     if fresh and 'linear_limits' in command:
@@ -393,7 +393,7 @@ def main():
                 last_limit_publish = now
             linear, angular = velocity(command, now)
             pose, problem = control_pose(now)
-            if now-last_heartbeat > 0.4:
+            if now-last_heartbeat > 2.0:
                 if tracker.state in tracker.ACTIVE:
                     tracker.pause('CONTROL_TIMEOUT')
                 if enable_sent:

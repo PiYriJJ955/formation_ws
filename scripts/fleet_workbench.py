@@ -367,6 +367,7 @@ class FleetWorkbench:
         self.iot_window = None
         self.iot_sessions = []
         self.iot_probes = []
+        self.ros_topics = None
         self.active_identities = {}
         self.active_offsets = {}
         self.control_dialog = self.keyboard = None
@@ -1439,6 +1440,7 @@ class FleetWorkbench:
         self.ttk.Label(page, textvariable=self.metrics, wraplength=1080).pack(fill='x', pady=6)
         self.make_parameter_page()
         self.make_iot_extract_page()
+        self.make_ros_topics_page()
 
     def make_iot_extract_page(self):
         page = self.ttk.Frame(self.app.notebook, padding=10)
@@ -1446,6 +1448,13 @@ class FleetWorkbench:
         self.iot_extract_page = page
         from fleet_iot import IotExtractPage
         self.iot_extract = IotExtractPage(self, page)
+
+    def make_ros_topics_page(self):
+        page = self.ttk.Frame(self.app.notebook, padding=10)
+        self.app.notebook.add(page, text='ROS 话题查看')
+        self.ros_topics_page = page
+        from fleet_iot import RosTopicPage
+        self.ros_topics = RosTopicPage(self, page)
 
     def make_parameter_page(self):
         page = self.ttk.Frame(self.app.notebook, padding=10)
@@ -1745,6 +1754,8 @@ class FleetWorkbench:
     def poll(self):
         if getattr(self, 'iot_extract', None):
             self.iot_extract.poll()
+        if getattr(self, 'ros_topics', None):
+            self.ros_topics.poll()
         if self.monitor:
             self.monitor.ui_heartbeat = time.monotonic()
         for _ in range(200):
@@ -1861,6 +1872,8 @@ class FleetWorkbench:
             self.iot_window.close()
         if getattr(self, 'iot_extract', None):
             self.iot_extract.close()
+        if getattr(self, 'ros_topics', None):
+            self.ros_topics.close()
         for session in self.iot_sessions + self.iot_probes:
             session.stop.set()
         self.stop()

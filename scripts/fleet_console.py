@@ -621,7 +621,8 @@ class FleetConsole:
         self.vehicle_menu = tk.Menu(root, tearoff=False)
         for table in (self.table, self.workbench.vehicles):
             table.bind('<Button-3>', self.show_vehicle_menu)
-        self.notebook.select(max(0, min(4, int(self.vars['active_tab'].get()))))
+        # Six tabs are created by FleetWorkbench, including the ROS topic viewer.
+        self.notebook.select(max(0, min(5, int(self.vars['active_tab'].get()))))
         def tab_changed(_):
             self.stop_motion()
             self.workbench.armed.set(False)

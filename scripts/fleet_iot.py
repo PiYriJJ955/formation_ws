@@ -3,6 +3,7 @@ from collections import deque
 from datetime import datetime
 import json
 import math
+import ipaddress
 from pathlib import Path
 import queue
 import shlex
@@ -11,6 +12,8 @@ import stat
 import threading
 import time
 import uuid
+
+import yaml
 
 from fleet_deploy import robot_number, run_remote, shell_path
 
@@ -668,3 +671,350 @@ class IotExtractPage:
             self.show_selected()
         if changed and self.states and not any(value == '提取中' for value in self.states.values()):
             self.status.set('提取完成；请选择车辆查看文件，双击文件可查看内容。')
+
+
+# ROS topic labels are intentionally suffix based: every vehicle publishes the
+# same topic set under /ugvN, while /tf and /rosout stay global.
+ROS_TOPIC_LABELS = {
+    '/rosout': 'ROS 日志', '/rosout_agg': 'ROS 聚合日志', '/tf': '坐标变换',
+    '/tf_static': '静态坐标变换', 'PowerVoltage': '电源电压', 'cmd_vel': '速度指令',
+    'imu': 'IMU 惯性数据', 'joint_states': '关节状态',
+    'nlink_linktrack_data_transmission': 'LinkTrack 数据传输',
+    'nlink_linktrack_nodeframe2': 'LinkTrack 节点帧', 'odom': '里程计',
+    'odom_combined': '融合里程计', 'uwb/diagnostics': 'UWB 诊断',
+    'uwb/dropped_frame_count': 'UWB 丢帧数', 'uwb/full_residual_rms': 'UWB 总残差 RMS',
+    'uwb/jump_rejected_ids': 'UWB 跳变剔除 ID', 'uwb/loo_excluded_id': 'UWB 留一剔除 ID',
+    'uwb/measurement_age': 'UWB 测量年龄', 'uwb/path': 'UWB 轨迹',
+    'uwb/point': 'UWB 点位', 'uwb/pose': 'UWB 位姿',
+    'uwb/pose_covariance': 'UWB 位姿协方差', 'uwb/processing_time': 'UWB 处理耗时',
+    'uwb/residual_rms': 'UWB 残差 RMS', 'uwb/status': 'UWB 定位状态',
+    'uwb/used_anchor_count': 'UWB 使用基站数', 'uwb/valid': 'UWB 有效标志',
+}
+ROS_FIELD_LABELS = {
+    'header': '消息头', 'stamp': '时间戳', 'frame_id': '坐标系', 'seq': '序号',
+    'position': '位置', 'orientation': '方向', 'linear': '线速度', 'angular': '角速度',
+    'velocity': '速度', 'twist': '速度变化', 'pose': '位姿', 'covariance': '协方差',
+    'x': 'X', 'y': 'Y', 'z': 'Z', 'w': 'W', 'roll': '横滚角', 'pitch': '俯仰角',
+    'yaw': '偏航角', 'name': '关节名称', 'position': '位置', 'effort': '力矩 / 努力',
+    'status': '状态', 'valid': '有效', 'value': '数值', 'data': '数据',
+}
+
+
+def topic_label(topic):
+    """Return a compact Chinese label while keeping the full topic visible."""
+    matches = [(key, label) for key, label in ROS_TOPIC_LABELS.items()
+               if topic == key or topic.endswith('/' + key.lstrip('/'))]
+    if matches:
+        return max(matches, key=lambda item: len(item[0]))[1]
+    return topic.rsplit('/', 1)[-1]
+
+
+def parse_topic_listing(text):
+    """Parse ``topic<TAB>type`` output, tolerating plain ``rostopic list``."""
+    result, seen = [], set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('WARNING:') or line.startswith('__'):
+            continue
+        if '\t' in line:
+            topic, msg_type = line.split('\t', 1)
+        else:
+            topic, msg_type = line, ''
+        topic, msg_type = topic.strip(), msg_type.strip()
+        if not topic.startswith('/') or topic in seen:
+            continue
+        seen.add(topic)
+        result.append({'topic': topic, 'type': msg_type, 'label': topic_label(topic)})
+    return sorted(result, key=lambda item: item['topic'])
+
+
+def parse_topic_query(text):
+    """Extract type and one YAML message from the marked remote command output."""
+    msg_type, payload = '', []
+    for line in text.splitlines():
+        if line.startswith('__ROS_TYPE__'):
+            msg_type = line[len('__ROS_TYPE__'):].strip()
+        elif line.startswith('__ROS_BEGIN__'):
+            continue
+        else:
+            payload.append(line)
+    raw = '\n'.join(payload).strip()
+    if not raw:
+        return msg_type, None, ''
+    try:
+        value = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        return msg_type, None, raw
+    return msg_type, value, raw
+
+
+def _friendly_scalar(value):
+    if isinstance(value, bool):
+        return '是' if value else '否'
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return str(value)
+        return '%.6g' % value
+    if value is None:
+        return '—'
+    return str(value)
+
+
+def flatten_ros_message(value, prefix='', limit=120):
+    """Flatten a ROS YAML message into (friendly path, value) rows."""
+    rows = []
+
+    def walk(node, path):
+        if len(rows) >= limit:
+            return
+        if isinstance(node, dict):
+            for key, child in node.items():
+                label = ROS_FIELD_LABELS.get(str(key), str(key))
+                walk(child, (path + ' · ' if path else '') + label)
+        elif isinstance(node, (list, tuple)):
+            for index, child in enumerate(node[:40]):
+                walk(child, '%s [%d]' % (path or '数据', index))
+            if len(node) > 40:
+                rows.append((path or '数据', '…（其余 %d 项已省略）' % (len(node) - 40)))
+        else:
+            rows.append((path or '数据', _friendly_scalar(node)))
+
+    walk(value, prefix)
+    return rows
+
+
+def _ros_topic_command(options, ip, command):
+    master = str(ipaddress.IPv4Address(options.get('master_ip', ip)))
+    address = str(ipaddress.IPv4Address(ip))
+    workspace = options.get('workspace', '~/formation_ws').rstrip('/')
+    return ('set -e; source %s; export ROS_MASTER_URI=%s ROS_IP=%s; '
+            'unset ROS_HOSTNAME ROS_NAMESPACE; %s' %
+            (shell_path(workspace + '/scripts/env.sh'), shlex.quote('http://%s:11311' % master),
+             shlex.quote(address), command))
+
+
+class RosTopicPage:
+    """Inspect ROS topics on the selected vehicles through their existing SSH setup."""
+    def __init__(self, workbench, page):
+        self.workbench, self.app, self.tk, self.ttk = workbench, workbench.app, workbench.tk, workbench.ttk
+        self.page = page
+        self.events, self.busy, self.requests = queue.Queue(), set(), []
+        self.topic_cache, self.states = {}, {}
+        self.current_ip = None
+        self.closed = False
+
+        self.ttk.Label(page, text='通过 SSH 连接车辆的 ROS Master，查看话题列表、消息类型和最新一条数据；全局话题（/tf、/rosout）也会列出。',
+                       wraplength=1080).pack(anchor='w')
+        toolbar = self.ttk.Frame(page)
+        toolbar.pack(fill='x', pady=6)
+        self.ttk.Button(toolbar, text='刷新全部状态', command=self.refresh_all).pack(side='left')
+        self.ttk.Button(toolbar, text='刷新选中车辆话题', command=self.refresh_selected).pack(side='left', padx=6)
+        self.ttk.Button(toolbar, text='查询选中话题', command=self.query_selected).pack(side='left')
+        self.ttk.Button(toolbar, text='清空消息', command=self.clear_message).pack(side='left', padx=6)
+        self.ttk.Label(toolbar, text='筛选').pack(side='left', padx=(18, 4))
+        self.filter_var = self.tk.StringVar()
+        self.filter_var.trace_add('write', lambda *_: self._show_topics())
+        self.ttk.Entry(toolbar, textvariable=self.filter_var, width=28).pack(side='left')
+        self.status = self.tk.StringVar(value='请选择车辆并刷新话题。')
+        self.ttk.Label(page, textvariable=self.status, wraplength=1080).pack(fill='x')
+
+        panes = self.ttk.Panedwindow(page, orient='horizontal')
+        panes.pack(fill='both', expand=True, pady=8)
+        left, right = self.ttk.Frame(panes, padding=(0, 0, 8, 0)), self.ttk.Frame(panes)
+        panes.add(left, weight=1)
+        panes.add(right, weight=2)
+        self.ttk.Label(left, text='车辆 ROS 状态').pack(anchor='w', pady=(0, 5))
+        self.vehicles = self.ttk.Treeview(left, columns=('ip', 'name', 'state', 'count'), show='headings', selectmode='browse')
+        for key, title, width in [('ip', 'IP', 130), ('name', '车辆', 68), ('state', 'ROS 状态', 150), ('count', '话题数', 65)]:
+            self.vehicles.heading(key, text=title)
+            self.vehicles.column(key, width=width, minwidth=55, stretch=key == 'state')
+        self.vehicles.pack(fill='both', expand=True)
+        self.vehicles.bind('<<TreeviewSelect>>', self._vehicle_selected)
+        self.ttk.Label(right, text='话题（双击或点击“查询选中话题”读取最新消息）').pack(anchor='w', pady=(0, 5))
+        self.topics = self.ttk.Treeview(right, columns=('topic', 'label', 'type', 'state'), show='headings', selectmode='browse')
+        for key, title, width in [('topic', '话题', 300), ('label', '友好名称', 150), ('type', '消息类型', 180), ('state', '数据状态', 95)]:
+            self.topics.heading(key, text=title)
+            self.topics.column(key, width=width, minwidth=70, stretch=key in ('topic', 'label'))
+        topic_scroll = self.ttk.Scrollbar(right, orient='vertical', command=self.topics.yview)
+        self.topics.configure(yscrollcommand=topic_scroll.set)
+        topic_scroll.pack(side='right', fill='y')
+        self.topics.pack(fill='both', expand=True)
+        self.topics.bind('<Double-1>', lambda _: self.query_selected())
+        self.ttk.Label(right, text='最新消息（字段已翻译；列表过长时自动折叠数组）').pack(anchor='w', pady=(8, 3))
+        message_frame = self.ttk.Frame(right)
+        message_frame.pack(fill='both', expand=True)
+        self.message = self.tk.Text(message_frame, height=10, wrap='none', state='disabled', font=('Monospace', 10))
+        message_scroll = self.ttk.Scrollbar(message_frame, orient='vertical', command=self.message.yview)
+        self.message.configure(yscrollcommand=message_scroll.set)
+        message_scroll.pack(side='right', fill='y')
+        self.message.pack(fill='both', expand=True)
+        self._refresh_vehicles()
+
+    def _refresh_vehicles(self):
+        known = {ip for ip, row in self.app.robots.items() if row.get('robot_id')}
+        for ip in self.vehicles.get_children():
+            if ip not in known:
+                self.vehicles.delete(ip)
+        for ip, row in self.app.robots.items():
+            if not row.get('robot_id'):
+                continue
+            self.states.setdefault(ip, '未查询')
+            values = (ip, row.get('robot_id', ''), self.states[ip], len(self.topic_cache.get(ip, ())))
+            if self.vehicles.exists(ip):
+                self.vehicles.item(ip, values=values)
+            else:
+                self.vehicles.insert('', 'end', iid=ip, values=values)
+        if self.current_ip not in known:
+            self.current_ip = next(iter(sorted(known, key=ipaddress.IPv4Address)), None)
+            if self.current_ip and self.vehicles.exists(self.current_ip):
+                self.vehicles.selection_set(self.current_ip)
+
+    def _vehicle_selected(self, _=None):
+        selected = self.vehicles.selection()
+        if not selected:
+            return
+        self.current_ip = selected[0]
+        self._show_topics()
+
+    def _selected_ip(self):
+        selected = self.vehicles.selection()
+        return selected[0] if selected else self.current_ip
+
+    def _show_topics(self):
+        self.topics.delete(*self.topics.get_children())
+        topics = self.topic_cache.get(self.current_ip, ())
+        needle = self.filter_var.get().strip().lower()
+        for item in topics:
+            if needle and needle not in (item['topic'] + ' ' + item['label'] + ' ' + item.get('type', '')).lower():
+                continue
+            state = item.get('state', '可查询')
+            self.topics.insert('', 'end', iid=item['topic'], values=(item['topic'], item['label'], item.get('type', ''), state))
+
+    def _request(self, ip, action, topic=None):
+        key = (ip, action, topic or '')
+        if not ip or key in self.busy:
+            return
+        options = self.app.current_options()
+        stop = threading.Event()
+        self.busy.add(key)
+        self.requests.append(stop)
+
+        def run():
+            client = None
+            try:
+                client = self.workbench.connect(ip, options)
+                if action == 'topics':
+                    # ``rostopic type`` performs one master lookup per topic and
+                    # becomes very slow on a full fleet.  List first; resolve a
+                    # type only when the user asks for a specific message.
+                    output = run_remote(client, _ros_topic_command(options, ip, 'timeout 7 rostopic list'),
+                                        stop, timeout=10)
+                    self.events.put((ip, action, parse_topic_listing(output)))
+                else:
+                    quoted = shlex.quote(topic)
+                    command = ('type=$(rostopic type %s); printf "__ROS_TYPE__%%s\\n" "$type"; '
+                               'printf "__ROS_BEGIN__\\n"; timeout 5 rostopic echo -n 1 %s || test $? -eq 124' % (quoted, quoted))
+                    output = run_remote(client, _ros_topic_command(options, ip, command), stop, timeout=10)
+                    msg_type, value, raw = parse_topic_query(output)
+                    self.events.put((ip, action, dict(topic=topic, type=msg_type, value=value, raw=raw)))
+            except Exception as error:
+                self.events.put((ip, 'error', str(error)))
+            finally:
+                if client:
+                    client.close()
+                self.events.put((ip, 'finished', key))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def refresh_all(self):
+        addresses = [ip for ip, row in self.app.robots.items() if row.get('robot_id')]
+        if not addresses:
+            self.status.set('暂无已识别车辆，请先扫描并连接。')
+            return
+        for ip in addresses:
+            self.states[ip] = '正在查询'
+            self._request(ip, 'topics')
+        self._refresh_vehicles()
+        self.status.set('正在查询 %d 辆车的 ROS Master 和话题列表…' % len(addresses))
+
+    def refresh_selected(self):
+        ip = self._selected_ip()
+        if not ip:
+            self.status.set('请先选择车辆')
+            return
+        self.states[ip] = '正在查询'
+        self._request(ip, 'topics')
+        self._refresh_vehicles()
+
+    def query_selected(self):
+        ip = self._selected_ip()
+        selected = self.topics.selection()
+        if not ip or not selected:
+            self.status.set('请先选择车辆和话题')
+            return
+        topic = selected[0]
+        self.status.set('%s 正在读取 %s 的最新消息…' % (ip, topic))
+        self._request(ip, 'message', topic)
+
+    def clear_message(self):
+        self.message.configure(state='normal')
+        self.message.delete('1.0', 'end')
+        self.message.configure(state='disabled')
+
+    def _show_message(self, ip, data):
+        self.message.configure(state='normal')
+        self.message.delete('1.0', 'end')
+        self.message.insert('end', '车辆：%s\n话题：%s · %s\n消息类型：%s\n读取时间：%s\n\n' %
+                            (ip, data['topic'], topic_label(data['topic']), data.get('type') or '未知',
+                             datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        if data.get('value') is None:
+            self.message.insert('end', '当前没有收到消息（话题可能未发布或数据暂时过期）。\n')
+            if data.get('raw'):
+                self.message.insert('end', '\n原始输出：\n' + data['raw'][:10000])
+        else:
+            rows = flatten_ros_message(data['value'])
+            if rows:
+                width = max(len(key) for key, _ in rows)
+                self.message.insert('end', '\n'.join(('%-*s : %s' % (width, key, value)) for key, value in rows))
+            else:
+                self.message.insert('end', _friendly_scalar(data['value']))
+        self.message.configure(state='disabled')
+        for item in self.topic_cache.get(ip, ()):
+            if item['topic'] == data['topic']:
+                if data.get('type'):
+                    item['type'] = data['type']
+                item['state'] = '已获取'
+        if ip == self.current_ip:
+            self._show_topics()
+
+    def poll(self):
+        if self.closed:
+            return
+        self._refresh_vehicles()
+        changed = False
+        while True:
+            try:
+                ip, event, value = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if event == 'topics':
+                self.topic_cache[ip] = value
+                self.states[ip] = '在线'
+                changed = True
+            elif event == 'message':
+                self._show_message(ip, value)
+                self.status.set('%s · 已读取 %s' % (ip, value['topic']))
+            elif event == 'error':
+                self.states[ip] = '离线：' + value
+                self.status.set('%s ROS 查询失败：%s' % (ip, value))
+                changed = True
+            elif event == 'finished':
+                self.busy.discard(value)
+        if changed:
+            self._refresh_vehicles()
+            self._show_topics()
+
+    def close(self):
+        self.closed = True
+        for stop in self.requests:
+            stop.set()
