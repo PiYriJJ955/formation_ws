@@ -47,6 +47,7 @@ add_message_files(
     TofsenseMFrame0Pixel.msg
     IotFrame0.msg
     IotFrame0Node.msg
+    IotObservation.msg
 )
 
 # # Generate services in the 'srv' folder

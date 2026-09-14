@@ -449,7 +449,15 @@ class RobotSession:
                 self.closed.wait(0.02)
         except Exception as error:
             if not self.closed.is_set():
-                self.emit('status', chassis='启动/连接失败', error=str(error))
+                # A chassis launched outside this console owns the serial device.
+                # Treat this as an explicit state instead of a generic startup
+                # failure so the operator knows the vehicle is already running
+                # and must stop that task before enabling independent control.
+                message = str(error)
+                if 'serial port already in use' in message.lower():
+                    self.emit('status', chassis='已有底盘运行', error=message + '；请先停止车端底盘任务')
+                else:
+                    self.emit('status', chassis='启动/连接失败', error=message)
         finally:
             self.ready = self.starting = False
             if channel is not None:

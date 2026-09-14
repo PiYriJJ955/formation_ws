@@ -37,6 +37,7 @@ class IotChecks(unittest.TestCase):
         self.assertEqual([s['uid'] for s in sensors], [0x30006E00, 0x2A003200])
         self.assertEqual(len(sensors_for({'robot_id': 'ugv2'})), 1)
         validate_ports('/dev/uwb_linktrack', sensors)
+        validate_ports('', sensors)  # A vehicle may be configured for IOT only.
         for port in ('/dev/uwb_iot', 'ttyUSB1', '/dev/x\n'):
             with self.assertRaises(ValueError):
                 validate_ports(port, sensors)

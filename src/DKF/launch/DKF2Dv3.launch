@@ -1,0 +1,84 @@
+<launch>
+  <include file="$(find turn_on_wheeltec_robot)/launch/turn_on_wheeltec_robot.launch">
+	    <arg name="navigation"  default="false"/>
+  </include>
+
+  <include file="$(find nlink_parser)/launch/iot.launch"/>
+  
+  <include file="$(find nlink_parser)/launch/iot1.launch"/>
+
+  <include file="$(find nlink_parser)/launch/linktrack.launch"/>
+
+<!--   <node pkg="DKF" type="absolute_location" name="absolute_location" output="screen">
+
+  <param name="id_1" value="10"/>
+  <param name="id_2" value="11"/>
+  <param name="id_3" value="12"/>
+
+
+  <param name="anchor1_x" value="0"/>
+  <param name="anchor1_y" value="0"/>
+
+  <param name="anchor2_x" value="0"/>
+  <param name="anchor2_y" value="1.8"/>
+
+  <param name="anchor3_x" value="1.8"/>
+  <param name="anchor3_y" value="0"/>
+
+
+  <param name="x_hat" value="1.2"/>
+  <param name="y_hat" value="0"/>
+  <param name="f_hat" value="0"/>
+
+  </node>
+ -->
+  <node pkg="DKF" type="imu_fusion" name="imu_fusion" output="screen">
+  </node>  
+
+  <node pkg="DKF" type="getabsolutedata" name="getabsolutedata" output="screen">
+  </node>    
+
+  
+  <node pkg="DKF" type="DKF2Dv3" name="DKF2D" output="screen">
+  <param name="x_1_hat" value="0"/>
+  <param name="y_1_hat" value="0"/>
+  <param name="f_1_hat" value="0"/>
+
+  <param name="x_2_hat" value="0"/>
+  <param name="y_2_hat" value="1.5"/>
+  <param name="f_2_hat" value="0"/>
+
+  <param name="x_3_hat" value="0"/>
+  <param name="y_3_hat" value="-1.5"/>
+  <param name="f_3_hat" value="0"/> 
+
+  <param name="x_1_minus" value="0"/>
+  <param name="y_1_minus" value="0"/>
+  <param name="f_1_minus" value="0"/>
+
+  <param name="x_2_minus" value="0"/>
+  <param name="y_2_minus" value="1.5"/>
+  <param name="f_2_minus" value="0"/>
+
+  <param name="x_3_minus" value="0"/>
+  <param name="y_3_minus" value="-1.5"/>
+  <param name="f_3_minus" value="0"/>
+
+  <param name="varQ1" value="0.01"/>
+  <param name="varQ2" value="0.03"/>
+  <param name="varQ3" value="0.03"/>
+  <param name="varR1" value="0.05"/>  
+  <param name="varR2" value="0.05"/> 
+  <param name="varR3" value="0.6"/> 
+  </node>
+
+  <node pkg="DKF" type="listen101.py" name="listen101" output="screen">
+  </node>
+
+  <node pkg="DKF" type="listen102.py" name="listen102" output="screen">
+  </node>  
+
+  <node pkg="DKF" type="send100.py" name="send100" output="screen" >
+  </node> 
+
+</launch>

@@ -415,7 +415,6 @@ class FleetWorkbench:
         self.vehicles.bind('<<TreeviewSelect>>', self.remember_selection)
         self.refresh_vehicles()
         self.vehicles.selection_set([ip for ip in app.vars['formation_selected'].get().split(',') if ip in app.robots])
-        self.ttk.Button(page, text='编辑选中车 UWB 串口 / 编队偏移', command=self.edit_vehicle).pack(anchor='w', pady=5)
         steps = self.ttk.Notebook(page)
         steps.pack(fill='x', pady=4)
         for title, description, actions in [
@@ -1008,6 +1007,10 @@ class FleetWorkbench:
 
     def open_iot(self):
         from fleet_iot import IotWindow, sensors_for
+        if hasattr(self, 'iot_vehicle_box') and self.iot_vehicle_box.get():
+            ip = self.iot_vehicle_box.get().split(' · ', 1)[0]
+            if ip in self.app.robots:
+                self.vehicles.selection_set([ip])
         if self.iot_window and not self.iot_window.closed:
             self.iot_window.dialog.lift()
             return
@@ -1369,7 +1372,6 @@ class FleetWorkbench:
         toolbar = self.ttk.Frame(page)
         toolbar.pack(fill='x')
         self.ttk.Button(toolbar, text='连接实时监视', command=lambda: self.start('monitor')).pack(side='left')
-        self.ttk.Button(toolbar, text='启动 IOT 实时监视', command=self.open_iot).pack(side='left', padx=6)
         self.ttk.Button(toolbar, text='编辑基站坐标 / 定位参数', command=self.edit_anchors).pack(side='left', padx=8)
         self.ttk.Button(toolbar, text='清空轨迹', command=self.clear_trails).pack(side='left')
         self.ttk.Button(toolbar, text='立即停车 / 禁用跟随', command=self.emergency).pack(side='right')
@@ -1439,8 +1441,48 @@ class FleetWorkbench:
         self.metrics = self.tk.StringVar(value='三角形：基站　圆点：车辆　十字：跟踪目标　虚线：位置误差　灰色：定位无效 / 数据过期')
         self.ttk.Label(page, textvariable=self.metrics, wraplength=1080).pack(fill='x', pady=6)
         self.make_parameter_page()
+        self.make_iot_monitor_page()
         self.make_iot_extract_page()
         self.make_ros_topics_page()
+
+    def make_iot_monitor_page(self):
+        page = self.ttk.Frame(self.app.notebook, padding=10)
+        self.app.notebook.add(page, text='IOT 实时监视')
+        self.iot_monitor_page = page
+        self.ttk.Label(page, text='选择车辆后可一键识别 / 配置 IOT 串口，再启动实时监视；ugv3 将同时启动主模块和辅助模块。').pack(anchor='w', pady=(0, 6))
+        self.iot_vehicle_box = self.ttk.Combobox(page, state='readonly', width=34)
+        self.iot_vehicle_box.pack(side='left', padx=(0, 8))
+        self.refresh_iot_vehicle_choices()
+        self.ttk.Button(page, text='识别 / 配置 IOT 串口', command=self.edit_iot_vehicle).pack(side='left')
+        self.ttk.Button(page, text='启动 IOT 实时监视', command=self.open_iot).pack(side='left')
+        self.ttk.Button(page, text='停止采集', command=self.stop_iot).pack(side='left', padx=8)
+        self.iot_monitor_status = self.tk.StringVar(value='尚未启动')
+        self.ttk.Label(page, textvariable=self.iot_monitor_status).pack(side='left', padx=8)
+
+    def refresh_iot_vehicle_choices(self):
+        if not hasattr(self, 'iot_vehicle_box'):
+            return
+        choices = ['%s · %s' % (ip, self.app.robots[ip].get('robot_id') or '未编号')
+                   for ip in sorted(self.app.robots)]
+        self.iot_vehicle_box['values'] = choices
+        if choices and not self.iot_vehicle_box.get():
+            self.iot_vehicle_box.current(0)
+
+    def edit_iot_vehicle(self):
+        value = self.iot_vehicle_box.get().strip()
+        ip = value.split(' · ', 1)[0] if value else ''
+        if ip not in self.app.robots:
+            self.app.messagebox.showerror('IOT 串口', '请先选择一辆车', parent=self.iot_monitor_page)
+            return
+        self.vehicles.selection_set([ip])
+        self.vehicles.see(ip)
+        return self.edit_vehicle()
+
+    def stop_iot(self):
+        if self.iot_window and not self.iot_window.closed:
+            try: self.iot_window.close()
+            except Exception: pass
+        self.iot_monitor_status.set('已停止')
 
     def make_iot_extract_page(self):
         page = self.ttk.Frame(self.app.notebook, padding=10)

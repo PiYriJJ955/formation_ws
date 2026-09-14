@@ -17,11 +17,24 @@ import yaml
 
 from fleet_deploy import robot_number, run_remote, shell_path
 
-UIDS = {'ugv2': (0x15003B00,), 'ugv3': (0x30006E00, 0x2A003200), 'ugv4': (0x30003000,)}
+UIDS = {
+    'ugv1': (0x14004E00,),
+    'ugv2': (0x15003B00,),
+    'ugv3': (0x30006E00, 0x2A003200),
+    'ugv4': (0x30003000,),
+    'ugv5': (0x31005D00,),
+}
 NAMES = {0x15003B00: 'ugv2', 0x30006E00: 'ugv3_right',
-         0x2A003200: 'ugv3_left', 0x30003000: 'ugv4'}
-LINKS = [(a, b) for pair in [(0x2A003200, 0x15003B00), (0x30006E00, 0x30003000),
-                           (0x15003B00, 0x30003000)] for a, b in (pair, pair[::-1])]
+         0x2A003200: 'ugv3_left', 0x14004E00: 'ugv1', 0x30003000: 'ugv4',
+         0x31005D00: 'ugv5'}
+# The 12 directed measurements defined in AGENTS.md.
+LINKS = [(0x2A003200, 0x15003B00), (0x14004E00, 0x2A003200),
+         (0x30006E00, 0x30003000), (0x30006E00, 0x31005D00),
+         (0x15003B00, 0x2A003200), (0x15003B00, 0x31005D00),
+         (0x14004E00, 0x30003000), (0x2A003200, 0x14004E00),
+         (0x30003000, 0x30006E00),
+         (0x30003000, 0x14004E00), (0x31005D00, 0x30006E00),
+         (0x31005D00, 0x15003B00)]
 COLORS = ['#1976d2', '#e76622', '#009688', '#9b51b6', '#c0395a', '#8a7600',
           '#455a64', '#683b20', '#4169a1', '#ac4a05', '#087e71', '#69519c']
 
@@ -40,7 +53,10 @@ def sensors_for(row):
 
 
 def validate_ports(linktrack, sensors):
-    ports = [linktrack] + [s['port'] for s in sensors]
+    """Validate IOT ports; LinkTrack is optional for IOT-only vehicles."""
+    linktrack = '' if linktrack is None else linktrack
+    sensor_ports = [s['port'] for s in sensors]
+    ports = ([linktrack] if linktrack else []) + sensor_ports
     if any(not p.startswith('/dev/') or any(c in p for c in '\n\r\x00') for p in ports):
         raise ValueError('各设备串口必须填写 /dev/ 开头的设备路径')
     if len(set(ports)) != len(ports):
@@ -107,7 +123,7 @@ class IotSession:
             else:
                 robot = self.row['robot_id']
                 sensors = sensors_for(self.row)
-                validate_ports(self.row.get('formation_config', {}).get('UWB_PORT', '/dev/uwb_linktrack'), sensors)
+                validate_ports(self.row.get('formation_config', {}).get('UWB_PORT', ''), sensors)
                 workspace = self.options['workspace'].rstrip('/')
                 if workspace.startswith('~/'):
                     workspace = home + workspace[1:]
@@ -187,8 +203,8 @@ def edit_ports(workbench):
     dialog.geometry('950x580')
     dialog.columnconfigure(1, weight=1)
     fields, controls = {}, {}
-    definitions = [('UWB_PORT', 'uwb_linktrack · 编队定位',
-                    row.get('formation_config', {}).get('UWB_PORT', row.get('uwb_port') or '/dev/uwb_linktrack'))]
+    definitions = [('UWB_PORT', 'uwb_linktrack · 编队定位（可选；仅 IOT 可留空）',
+                    row.get('formation_config', {}).get('UWB_PORT', row.get('uwb_port') or ''))]
     definitions += [(s['name'], 'uwb_iot · ' + (uid_name(s['uid']) if s['uid'] else row['robot_id']) +
                      (' · 0x%08X' % s['uid'] if s['uid'] else ''), s['port']) for s in sensors]
     definitions += [(key, label, row.get('formation_config', {}).get(key, fallback)) for key, label, fallback in
@@ -220,7 +236,8 @@ def edit_ports(workbench):
             return
         status.set('正在通过 SSH 识别 UWB 设备…')
         session = IotSession(workbench, ip, row, app.current_options(), events,
-                             ports=[fields[key].get() for key in fields if 'OFFSET' not in key])
+                             ports=[fields[key].get() for key in fields
+                                    if 'OFFSET' not in key and fields[key].get().strip()])
         sessions.append(session)
         workbench.iot_probes.append(session)
 

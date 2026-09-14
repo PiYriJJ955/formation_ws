@@ -1,0 +1,36 @@
+<launch>
+  <include file="$(find turn_on_wheeltec_robot)/launch/turn_on_wheeltec_robot.launch">
+      <arg name="navigation"  default="false"/>
+  </include>
+
+
+  <include file="$(find nlink_parser)/launch/linktrack.launch"/>
+
+  <node pkg="DKF" type="imu_fusion" name="imu_fusion" output="screen">
+  </node>  
+
+
+  <node pkg="DKF" type="absolute_location" name="absolute_location" output="screen">
+  <!-- 可调的 UWB ID -->
+  <param name="id_1" value="10"/>
+  <param name="id_2" value="11"/>
+  <param name="id_3" value="12"/>
+
+  <!-- 可调的基站坐标 -->
+  <param name="anchor1_x" value="0"/>
+  <param name="anchor1_y" value="0"/>
+
+  <param name="anchor2_x" value="0"/>
+  <param name="anchor2_y" value="1.8"/>
+
+  <param name="anchor3_x" value="1.8"/>
+  <param name="anchor3_y" value="0"/>
+
+
+  <param name="x_hat" value="1.2"/>
+  <param name="y_hat" value="0"/>
+  <param name="f_hat" value="0"/>
+
+  </node>
+
+</launch>
