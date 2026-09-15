@@ -22,6 +22,10 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = ROOT / 'logs' / 'iot_calibration'
 ANGLES = tuple(range(-60, 61, 5))
 CAPTURE_SECONDS = 60.0
+# Live monitor: frames are buffered as compact (elapsed, measured, reference)
+# tuples and the canvas repaints on this cadence instead of once per frame.
+LIVE_SAMPLE_LIMIT = 20000
+LIVE_REFRESH_MS = 120
 OBSERVATION_FIELDS = (
     'capture_id', 'actual_angle_deg', 'source_uid', 'target_uid',
     'host_received', 'host_monotonic', 'elapsed_s', 'system_time',
@@ -122,6 +126,48 @@ def comparison_series(points, fit):
     return series
 
 
+def live_series(samples, fit, window_seconds=None):
+    """Build chart rows from the frames the IoT modules push in real time.
+
+    ``samples`` are ``(elapsed_s, measured_deg_or_None, reference_angle_deg)`` in
+    arrival order, exactly what :meth:`CalibrationApp.publish_live` stores. A
+    frame without a valid target angle stays in the rows as ``None`` so the chart
+    breaks the curve at the dropout instead of drawing a fake straight line
+    across it. ``window_seconds`` keeps only the newest slice of the stream.
+    """
+    usable = [sample for sample in samples if finite(sample[0])]
+    if not usable:
+        return {'rows': [], 'summary': {
+            'frames': 0, 'valid': 0, 'missing_pct': 100.0, 'mean_raw': None,
+            'std_raw': None, 'mean_fitted': None, 'reference_angle_deg': None,
+            'latest_s': None, 'span_s': 0.0}}
+    if window_seconds is not None:
+        newest = max(float(sample[0]) for sample in usable)
+        usable = [sample for sample in usable
+                  if newest - float(sample[0]) <= float(window_seconds)]
+    rows, values = [], []
+    for elapsed, measured, reference in usable:
+        raw = float(measured) if finite(measured) else None
+        if raw is not None:
+            values.append(raw)
+        rows.append({
+            'x': float(elapsed), 'raw': raw,
+            'fitted': None if (raw is None or not fit) else fit['a'] + fit['b'] * raw,
+            'reference_angle_deg': float(reference) if finite(reference) else None,
+        })
+    mean, std = population_stats(values)
+    reference = next((row['reference_angle_deg'] for row in reversed(rows)
+                      if row['reference_angle_deg'] is not None), None)
+    frames, valid = len(rows), len(values)
+    return {'rows': rows, 'summary': {
+        'frames': frames, 'valid': valid,
+        'missing_pct': 100.0 * (1.0 - valid / frames) if frames else 100.0,
+        'mean_raw': mean, 'std_raw': std,
+        'mean_fitted': None if (mean is None or not fit) else fit['a'] + fit['b'] * mean,
+        'reference_angle_deg': reference, 'latest_s': rows[-1]['x'],
+        'span_s': rows[-1]['x'] - rows[0]['x']}}
+
+
 def frame_extremes(path):
     """Return {actual_angle: (min_deg, max_deg, samples)} from the raw frame CSV.
 
@@ -142,7 +188,7 @@ def frame_extremes(path):
 
 
 def module_text(row):
-    """Format a stored module record for the comparison window header."""
+    """Format a stored module record for the angle chart window header."""
     if not row:
         return '未知'
     uid = row.get('uid')
@@ -371,8 +417,11 @@ class FitCanvas:
 
 
 class AngleChart:
-    """Draw the raw group angles next to the fitted angles on one canvas.
+    """Draw angle data against the current fit on one canvas.
 
+    Two modes share the same painter. ``groups`` charts the stored per-angle
+    means against the reference angle; ``live`` charts the frames the IoT
+    modules push while the operator watches, with the capture start as x = 0.
     Deliberately Tk-only: the calibration tool must keep running on the vehicle
     test laptop, which has no matplotlib installed, so this mirrors FitCanvas
     instead of importing a plotting library.
@@ -382,19 +431,36 @@ class AngleChart:
     FIT_COLOR = '#1976d2'
     SPREAD_COLOR = '#c3cfd8'
     IDEAL_COLOR = '#9aaab5'
+    BAND_COLOR = '#e6eef4'
+    # Cap the painted geometry so a long live stream still repaints smoothly.
+    MAX_LINE_POINTS = 1400
+    MAX_DOTS = 400
+    X_TICKS = 6
+    Y_STEP = 5.0
 
     def __init__(self, tk, parent):
         self.canvas = tk.Canvas(parent, background='#f7fafc', highlightthickness=0)
         self.canvas.pack(fill='both', expand=True)
         self.series, self.fit, self.code, self.options = [], None, '', {}
+        self.summary, self.mode, self.y_lock = {}, 'groups', None
         self.canvas.bind('<Configure>', lambda unused: self.paint())
 
     def show(self, series, fit, code, options):
-        self.series, self.fit, self.code, self.options = series, fit, code, options
+        self.mode, self.series, self.fit, self.code, self.options = (
+            'groups', series, fit, code, options)
+        self.summary, self.y_lock = {}, None
+        self.paint()
+
+    def show_live(self, series, summary, fit, code, options):
+        self.mode, self.series, self.fit, self.code, self.options = (
+            'live', series, fit, code, options)
+        self.summary = summary
         self.paint()
 
     def rows(self):
-        """Return one row per angle group, resolved for the selected x axis."""
+        """Return the rows to plot, resolved for the selected x axis."""
+        if self.mode == 'live':
+            return list(self.series)
         measured_axis = self.options.get('axis') == 'measured'
         spread = self.options.get('spread_points') or {}
         rows = []
@@ -407,43 +473,123 @@ class AngleChart:
             })
         return rows
 
+    @staticmethod
+    def segments(rows, key):
+        """Split a series into unbroken runs so dropouts stay visible as gaps."""
+        runs, run = [], []
+        for row in rows:
+            value = row.get(key)
+            if value is None:
+                if run:
+                    runs.append(run)
+                    run = []
+            else:
+                run.append((row['x'], value))
+        if run:
+            runs.append(run)
+        return runs
+
+    def thin(self, runs, limit=None):
+        """Drop every n-th point of very long runs to keep the painter cheap."""
+        limit = limit or self.MAX_LINE_POINTS
+        total = sum(len(run) for run in runs)
+        if total <= limit:
+            return runs, total
+        step = int(math.ceil(total / float(limit)))
+        thinned = []
+        for run in runs:
+            piece = run[::step]
+            if piece and piece[-1] != run[-1]:
+                piece.append(run[-1])
+            if piece:
+                thinned.append(piece)
+        return thinned, total
+
+    def lock_y(self, ymin, ymax):
+        """Keep one capture's y axis steady: widen it, never shrink it."""
+        key = self.options.get('lock_key')
+        if self.mode != 'live' or not key:
+            self.y_lock = None
+            return ymin, ymax
+        if self.y_lock is None or self.y_lock[0] != key:
+            self.y_lock = (key, ymin, ymax)
+        else:
+            self.y_lock = (key, min(self.y_lock[1], ymin), max(self.y_lock[2], ymax))
+        return self.y_lock[1], self.y_lock[2]
+
+    def draw_mean_lines(self, canvas, py, left, right):
+        """Horizontal markers for the visible window's raw and fitted averages."""
+        for key, color, label, offset in (
+                ('mean_raw', self.RAW_COLOR, '窗口均值', -12),
+                ('mean_fitted', self.FIT_COLOR, '拟合后均值', 12)):
+            value = self.summary.get(key)
+            if value is None:
+                continue
+            y_pos = py(value)
+            canvas.create_line(left, y_pos, right, y_pos, fill=color, dash=(5, 3), width=2)
+            canvas.create_text(right - 6, y_pos + offset, anchor='e', fill=color,
+                               text='%s %.3f°' % (label, value))
+
     def paint(self):
         canvas = self.canvas
         canvas.delete('all')
         width, height = max(420, canvas.winfo_width()), max(300, canvas.winfo_height())
+        live = self.mode == 'live'
         rows = self.rows()
         if not rows:
-            canvas.create_text(width / 2, height / 2, text='没有可显示的角度组', fill='#526574')
+            canvas.create_text(width / 2, height / 2, fill='#526574',
+                               text='等待 IoT 实时数据…请在主窗口连接模块并开始采集'
+                               if live else '没有可显示的角度组')
             return
         options = self.options
         show_raw = bool(options.get('raw', True))
         show_fit = bool(options.get('fit', True)) and self.fit is not None
-        show_spread = bool(options.get('spread', False)) and any(row['low'] is not None
-                                                                 for row in rows)
-        show_ideal = bool(options.get('ideal', True))
+        show_spread = (not live and bool(options.get('spread', False))
+                       and any(row['low'] is not None for row in rows))
+        show_mean = live and bool(options.get('mean', True))
+        show_ideal = bool(options.get('ideal', True)) and not live
+        reference = self.summary.get('reference_angle_deg') if live else None
+        if reference is not None and not options.get('reference', True):
+            reference = None
         xvalues = [row['x'] for row in rows]
         yvalues = []
         for row in rows:
-            if show_raw:
+            if show_raw and row['raw'] is not None:
                 yvalues.append(row['raw'])
-            if show_fit:
+            if show_fit and row['fitted'] is not None:
                 yvalues.append(row['fitted'])
             if show_spread:
                 yvalues.extend(value for value in (row['low'], row['high']) if value is not None)
             if show_ideal:
                 yvalues.append(row['x'])
+        if show_mean:
+            for value in (self.summary.get('mean_raw'), self.summary.get('mean_fitted')):
+                if value is not None:
+                    yvalues.append(value)
+        if reference is not None:
+            yvalues.append(reference)
         if not yvalues:
             yvalues = list(xvalues)
         xmin, xmax = min(xvalues), max(xvalues)
+        if live and xmax - xmin < 5.0:
+            # Hold the left edge still for the first frames instead of letting
+            # the x axis lurch on every repaint.
+            xmax = xmin + 5.0
         if abs(xmax - xmin) < 1e-9:
             xmin, xmax = xmin - 1, xmax + 1
-        xpad = max(1.0, (xmax - xmin) * 0.08)
+        xpad = max(1.0, (xmax - xmin) * (0.04 if live else 0.08))
         xmin, xmax = xmin - xpad, xmax + xpad
         ymin, ymax = min(yvalues), max(yvalues)
         if abs(ymax - ymin) < 1e-9:
             ymin, ymax = ymin - 1, ymax + 1
         ypad = max(2.0, (ymax - ymin) * 0.08)
         ymin, ymax = ymin - ypad, ymax + ypad
+        # Snap to whole 5° steps so a live axis stops jittering frame by frame.
+        ymin = math.floor(ymin / self.Y_STEP) * self.Y_STEP
+        ymax = math.ceil(ymax / self.Y_STEP) * self.Y_STEP
+        if ymax - ymin < 2 * self.Y_STEP:
+            ymin, ymax = ymin - self.Y_STEP, ymax + self.Y_STEP
+        ymin, ymax = self.lock_y(ymin, ymax)
         # Same layout rule as FitCanvas: keep the equation, the metrics and the
         # legend on separate rows above the axes so nothing overlaps.
         left, right, top, bottom = 66, width - 25, 84, height - 55
@@ -454,19 +600,52 @@ class AngleChart:
         def py(value):
             return bottom - (value - ymin) / (ymax - ymin) * (bottom - top)
 
-        for index in range(6):
-            xvalue = xmin + (xmax - xmin) * index / 5.0
-            yvalue = ymin + (ymax - ymin) * index / 5.0
+        def marker(x_pos, y_pos, color, shape):
+            if shape == 'square':
+                canvas.create_rectangle(x_pos - 4, y_pos - 4, x_pos + 4, y_pos + 4,
+                                        fill=color, outline='white')
+            else:
+                canvas.create_oval(x_pos - 4, y_pos - 4, x_pos + 4, y_pos + 4,
+                                   fill=color, outline='white')
+
+        def draw_series(key, color, shape):
+            runs = self.segments(rows, key)
+            painted, total = self.thin(runs)
+            for run in painted:
+                if len(run) > 1:
+                    coords = []
+                    for value_x, value_y in run:
+                        coords.extend((px(value_x), py(value_y)))
+                    canvas.create_line(*coords, fill=color, width=2)
+            if total <= self.MAX_DOTS:
+                for run in runs:
+                    for value_x, value_y in run:
+                        marker(px(value_x), py(value_y), color, shape)
+
+        span = options.get('capture_span') if live else None
+        if span:
+            band_left, band_right = max(xmin, min(span)), min(xmax, max(span))
+            if band_left < band_right:
+                canvas.create_rectangle(px(band_left), top, px(band_right), bottom,
+                                        fill=self.BAND_COLOR, outline='')
+        tick_format = '%.1f' if live else '%.2f'
+        for index in range(self.X_TICKS):
+            span_ratio = index / (self.X_TICKS - 1.0)
+            xvalue = xmin + (xmax - xmin) * span_ratio
+            yvalue = ymin + (ymax - ymin) * span_ratio
             canvas.create_line(px(xvalue), top, px(xvalue), bottom, fill='#e0e7ec')
-            canvas.create_text(px(xvalue), bottom + 17, text='%.2f' % xvalue, fill='#526574')
+            canvas.create_text(px(xvalue), bottom + 17, text=tick_format % xvalue, fill='#526574')
             canvas.create_line(left, py(yvalue), right, py(yvalue), fill='#e0e7ec')
             canvas.create_text(left - 8, py(yvalue), text='%.2f' % yvalue,
                                anchor='e', fill='#526574')
         canvas.create_line(left, bottom, right, bottom, fill='#526574')
         canvas.create_line(left, top, left, bottom, fill='#526574')
-        canvas.create_text((left + right) / 2, height - 16, fill='#243746',
-                           text='原始测量角 x（°）' if options.get('axis') == 'measured'
-                           else '实际角（参考）x（°）')
+        if live:
+            x_label = '时间 x（秒，自本次连接）'
+        else:
+            x_label = ('原始测量角 x（°）' if options.get('axis') == 'measured'
+                       else '实际角（参考）x（°）')
+        canvas.create_text((left + right) / 2, height - 16, fill='#243746', text=x_label)
         canvas.create_text(16, (top + bottom) / 2, text='角度 y（°）', angle=90, fill='#243746')
         if show_spread:
             for row in rows:
@@ -481,142 +660,262 @@ class AngleChart:
                 canvas.create_line(px(low), py(low), px(high), py(high),
                                    fill=self.IDEAL_COLOR, dash=(4, 4), width=1)
         if show_raw:
-            coords = []
-            for row in rows:
-                coords.extend((px(row['x']), py(row['raw'])))
-            if len(coords) > 2:
-                canvas.create_line(*coords, fill=self.RAW_COLOR, width=2)
-            for row in rows:
-                canvas.create_rectangle(px(row['x']) - 4, py(row['raw']) - 4,
-                                        px(row['x']) + 4, py(row['raw']) + 4,
-                                        fill=self.RAW_COLOR, outline='white')
+            draw_series('raw', self.RAW_COLOR, 'square')
         if show_fit:
-            coords = []
-            for row in rows:
-                coords.extend((px(row['x']), py(row['fitted'])))
-            if len(coords) > 2:
-                canvas.create_line(*coords, fill=self.FIT_COLOR, width=2)
-            for row in rows:
-                canvas.create_oval(px(row['x']) - 4, py(row['fitted']) - 4,
-                                   px(row['x']) + 4, py(row['fitted']) + 4,
-                                   fill=self.FIT_COLOR, outline='white')
+            draw_series('fitted', self.FIT_COLOR, 'oval')
+        if show_mean:
+            self.draw_mean_lines(canvas, py, left, right)
+        if reference is not None:
+            y_pos = py(reference)
+            canvas.create_line(left, y_pos, right, y_pos, fill='#7a8b98', dash=(4, 4), width=1)
+            canvas.create_text(left + 8, y_pos - 11, anchor='w', fill='#526574',
+                               text='实际角 %g°' % reference)
         if self.fit:
             title = '%s：拟合后角度 = %.6f %+.6f × 原始测量角' % (
                 self.code or '拟合', self.fit['a'], self.fit['b'])
+        elif live:
+            title = '尚未生成拟合：完成至少 3 个角度组后，蓝色拟合曲线才会出现'
+        else:
+            title = '尚未生成拟合：完成至少 3 个角度组后才会出现拟合后角度'
+        if live:
+            metrics = '帧 %d · 有效 %d · 缺测 %.1f%% · 窗口均值 %s · 拟合后均值 %s' % (
+                self.summary.get('frames', 0), self.summary.get('valid', 0),
+                self.summary.get('missing_pct', 0.0),
+                '—' if self.summary.get('mean_raw') is None
+                else '%.3f°' % self.summary['mean_raw'],
+                '—' if self.summary.get('mean_fitted') is None
+                else '%.3f°' % self.summary['mean_fitted'])
+        elif self.fit:
             metrics = 'n=%d    r=%s    RMSE=%.3f°    组数 %d' % (
                 self.fit['n'], '—' if self.fit['r'] is None else '%.5f' % self.fit['r'],
                 self.fit['rmse_deg'], len(rows))
         else:
-            title = '尚未生成拟合：完成至少 3 个角度组后才会出现拟合后角度'
             metrics = '当前仅显示原始测量角，共 %d 组' % len(rows)
         canvas.create_text(left + 8, 14, anchor='nw', fill='#243746', text=title)
         canvas.create_text(left + 8, 38, anchor='nw', fill='#526574', text=metrics)
-        canvas.create_text(right, 62, anchor='ne', fill='#71818c',
-                           text='橙方块：原始测量角   蓝圆点：拟合后角度   '
-                                '灰竖线：原始逐帧范围   灰虚线：理想 45°')
+        legend = ('橙方块：逐帧原始测量角   蓝圆点：逐帧拟合角度   橙/蓝虚线：窗口均值   '
+                  '灰虚线：实际角参考   浅色区：本组采集窗口' if live else
+                  '橙方块：原始测量角   蓝圆点：拟合后角度   '
+                  '灰竖线：原始逐帧范围   灰虚线：理想 45°')
+        canvas.create_text(right, 62, anchor='ne', fill='#71818c', text=legend)
 
 
-class AngleCompareWindow:
-    """Popup that applies the current fit and charts raw vs fitted angles.
+class AngleChartWindow:
+    """Live IoT angle monitor plus the stored-group comparison chart.
 
-    Reads nothing new from the vehicle: it reuses the loaded session (live or
-    history) and only touches ``observations.csv`` when the operator asks for
-    the raw per-frame spread.
+    Live mode is fed by the frames the IoT sessions push while a capture runs,
+    so the operator watches the real sensor data and the current fit together
+    instead of waiting for the 60 s group to finish. Both modes read the app's
+    current state on every repaint, so the single window always shows whatever
+    the main window is working on.
     """
 
+    MODE_LIVE = '实时逐帧（IoT 实时数据）'
+    MODE_GROUPS = '角度组均值对比'
+    LIVE_WINDOWS = (('最近 10 秒', 10.0), ('最近 30 秒', 30.0), ('全部', None))
     AXIS_CHOICES = ('实际角（参考）', '原始测量角')
 
-    def __init__(self, app, data, code, series, fit):
+    def __init__(self, app, mode=None):
         tk, ttk = app.tk, app.ttk
-        self.app, self.data, self.code = app, data, code
-        self.series, self.fit = series, fit
+        self.app = app
         self.tk, self.ttk = tk, ttk
         self.spread_points = None
-        self.variables = {
+        self.closed, self.dirty, self.last_draw, self.timer = False, True, 0.0, None
+        self.rows_cache, self.summary_cache = [], {}
+        self.group_vars = {
             'raw': tk.BooleanVar(value=True),
-            'fit': tk.BooleanVar(value=fit is not None),
+            'fit': tk.BooleanVar(value=True),
             'spread': tk.BooleanVar(value=False),
             'ideal': tk.BooleanVar(value=True),
         }
+        self.live_vars = {
+            'raw': tk.BooleanVar(value=True),
+            'fit': tk.BooleanVar(value=True),
+            'mean': tk.BooleanVar(value=True),
+            'reference': tk.BooleanVar(value=True),
+        }
         self.axis = tk.StringVar(value=self.AXIS_CHOICES[0])
+        self.live_window = tk.StringVar(value=self.LIVE_WINDOWS[0][0])
+        self.mode = tk.StringVar(value=mode or self.MODE_LIVE)
+        self.info_source, self.info_target = tk.StringVar(), tk.StringVar()
+        self.fit_detail, self.status = tk.StringVar(), tk.StringVar()
         self.window = tk.Toplevel(app.root)
-        self.window.title('角度对比图 · %s · %d 组' % (code or '当前记录', len(series)))
-        self.window.geometry('1120x800')
-        self.window.minsize(860, 580)
+        self.window.geometry('1180x820')
+        self.window.minsize(900, 600)
         self.window.transient(app.root)
         self.make_ui()
-        self.redraw()
+        self.window.protocol('WM_DELETE_WINDOW', self.close)
+        self.mode_changed()
+        self.tick()
 
     def make_ui(self):
         tk, ttk = self.tk, self.ttk
         outer = ttk.Frame(self.window, padding=10)
         outer.pack(fill='both', expand=True)
-        info = ttk.LabelFrame(outer, text='当前选中模块', padding=8)
+        info = ttk.LabelFrame(outer, text='当前选中模块与拟合函数', padding=8)
         info.pack(fill='x')
-        ttk.Label(info, wraplength=1050, justify='left',
-                  text='来源模块：' + module_text(self.data.get('source'))).grid(
-            row=0, column=0, sticky='w')
-        ttk.Label(info, wraplength=1050, justify='left',
-                  text='测得模块：' + module_text(self.data.get('target'))).grid(
-            row=1, column=0, sticky='w')
-        if self.fit:
-            detail = ('拟合编号 %s：拟合后角度 = %.6f %+.6f × 原始测量角'
-                      '（n=%d，r=%s，RMSE=%.4f°，Syhat=%.4f）' %
-                      (self.code or '未知', self.fit['a'], self.fit['b'], self.fit['n'],
-                       '—' if self.fit['r'] is None else '%.6f' % self.fit['r'],
-                       self.fit['rmse_deg'], self.fit['Syhat']))
-        else:
-            detail = '尚无拟合结果：完成至少 3 个角度组后才会出现拟合后角度曲线。'
-        ttk.Label(info, wraplength=1050, justify='left', text=detail).grid(
-            row=2, column=0, sticky='w')
+        for row, (label, variable) in enumerate((('来源模块：', self.info_source),
+                                                 ('测得模块：', self.info_target),
+                                                 ('当前拟合：', self.fit_detail))):
+            ttk.Label(info, text=label).grid(row=row, column=0, sticky='nw')
+            ttk.Label(info, textvariable=variable, wraplength=1040, justify='left').grid(
+                row=row, column=1, sticky='w')
 
-        controls = ttk.Frame(outer)
-        controls.pack(fill='x', pady=(8, 0))
-        ttk.Checkbutton(controls, text='原始测量角（组均值）', variable=self.variables['raw'],
+        mode = ttk.Frame(outer)
+        mode.pack(fill='x', pady=(8, 0))
+        ttk.Label(mode, text='视图').pack(side='left')
+        for choice in (self.MODE_LIVE, self.MODE_GROUPS):
+            ttk.Radiobutton(mode, text=choice, value=choice, variable=self.mode,
+                            command=self.mode_changed).pack(side='left', padx=(10, 0))
+
+        self.control_holder = ttk.Frame(outer)
+        self.control_holder.pack(fill='x', pady=(6, 0))
+        self.live_controls = ttk.Frame(self.control_holder)
+        ttk.Checkbutton(self.live_controls, text='逐帧原始测量角',
+                        variable=self.live_vars['raw'],
                         command=self.redraw).pack(side='left')
-        ttk.Checkbutton(controls, text='拟合后角度', variable=self.variables['fit'],
+        ttk.Checkbutton(self.live_controls, text='逐帧拟合后角度',
+                        variable=self.live_vars['fit'],
                         command=self.redraw).pack(side='left', padx=(12, 0))
-        ttk.Checkbutton(controls, text='原始逐帧范围（最小–最大）', variable=self.variables['spread'],
+        ttk.Checkbutton(self.live_controls, text='窗口均值', variable=self.live_vars['mean'],
+                        command=self.redraw).pack(side='left', padx=(12, 0))
+        ttk.Checkbutton(self.live_controls, text='实际角参考线',
+                        variable=self.live_vars['reference'],
+                        command=self.redraw).pack(side='left', padx=(12, 0))
+        ttk.Label(self.live_controls, text='时间窗口').pack(side='left', padx=(18, 4))
+        window_box = ttk.Combobox(self.live_controls, state='readonly', width=11,
+                                  textvariable=self.live_window,
+                                  values=[label for label, unused in self.LIVE_WINDOWS])
+        window_box.pack(side='left')
+        window_box.bind('<<ComboboxSelected>>', lambda unused: self.redraw())
+
+        self.group_controls = ttk.Frame(self.control_holder)
+        ttk.Checkbutton(self.group_controls, text='原始测量角（组均值）',
+                        variable=self.group_vars['raw'],
+                        command=self.redraw).pack(side='left')
+        ttk.Checkbutton(self.group_controls, text='拟合后角度', variable=self.group_vars['fit'],
+                        command=self.redraw).pack(side='left', padx=(12, 0))
+        ttk.Checkbutton(self.group_controls, text='原始逐帧范围（最小–最大）',
+                        variable=self.group_vars['spread'],
                         command=self.toggle_spread).pack(side='left', padx=(12, 0))
-        ttk.Checkbutton(controls, text='理想 45° 参考线', variable=self.variables['ideal'],
+        ttk.Checkbutton(self.group_controls, text='理想 45° 参考线',
+                        variable=self.group_vars['ideal'],
                         command=self.redraw).pack(side='left', padx=(12, 0))
-        ttk.Label(controls, text='x 轴').pack(side='left', padx=(18, 4))
-        axis = ttk.Combobox(controls, state='readonly', width=13, textvariable=self.axis,
-                            values=list(self.AXIS_CHOICES))
+        ttk.Label(self.group_controls, text='x 轴').pack(side='left', padx=(18, 4))
+        axis = ttk.Combobox(self.group_controls, state='readonly', width=13,
+                            textvariable=self.axis, values=list(self.AXIS_CHOICES))
         axis.pack(side='left')
         axis.bind('<<ComboboxSelected>>', lambda unused: self.redraw())
 
         bottom = ttk.Frame(outer)
         bottom.pack(side='bottom', fill='x', pady=(8, 0))
-        ttk.Button(bottom, text='导出对比数据 CSV', command=self.export_csv).pack(side='left')
-        ttk.Button(bottom, text='关闭', command=self.window.destroy).pack(side='right')
-        self.status = tk.StringVar(value='橙方块为原始测量角，蓝圆点为按当前拟合函数换算后的角度。')
-        ttk.Label(bottom, textvariable=self.status, wraplength=780).pack(side='left', padx=10)
+        ttk.Button(bottom, text='导出当前视图 CSV', command=self.export_csv).pack(side='left')
+        ttk.Button(bottom, text='关闭', command=self.close).pack(side='right')
+        ttk.Label(bottom, textvariable=self.status, wraplength=900).pack(side='left', padx=10)
 
         chart_frame = ttk.Frame(outer)
         chart_frame.pack(fill='both', expand=True, pady=(8, 0))
         self.chart = AngleChart(self.tk, chart_frame)
 
-    def current_options(self):
+    def mode_changed(self):
+        if self.mode.get() == self.MODE_LIVE:
+            self.group_controls.pack_forget()
+            self.live_controls.pack(fill='x')
+        else:
+            self.live_controls.pack_forget()
+            self.group_controls.pack(fill='x')
+        self.redraw()
+
+    def accept(self, unused_sample):
+        """Called by the app for every live frame; the timer does the painting."""
+        self.dirty = True
+
+    def tick(self):
+        """Repaint in batches so a fast sensor stream stays smooth."""
+        if self.closed:
+            return
+        now = time.monotonic()
+        # Repaint when new frames arrived, plus twice a second during a capture
+        # so the countdown and the rolling time window keep moving.
+        if self.dirty or (self.app.capture and now - self.last_draw >= 0.5):
+            self.dirty = False
+            self.last_draw = now
+            self.redraw()
+        self.timer = self.window.after(LIVE_REFRESH_MS, self.tick)
+
+    def live_options(self):
         return {
-            'raw': self.variables['raw'].get(), 'fit': self.variables['fit'].get(),
-            'spread': self.variables['spread'].get(), 'ideal': self.variables['ideal'].get(),
+            'raw': self.live_vars['raw'].get(), 'fit': self.live_vars['fit'].get(),
+            'mean': self.live_vars['mean'].get(),
+            'reference': self.live_vars['reference'].get(),
+            'lock_key': self.app.capture['id'] if self.app.capture else None,
+            'capture_span': self.app.live_span,
+        }
+
+    def group_options(self):
+        return {
+            'raw': self.group_vars['raw'].get(), 'fit': self.group_vars['fit'].get(),
+            'spread': self.group_vars['spread'].get(), 'ideal': self.group_vars['ideal'].get(),
             'axis': 'measured' if self.axis.get() == self.AXIS_CHOICES[1] else 'actual',
             'spread_points': self.spread_points or {},
         }
 
     def redraw(self):
-        self.chart.show(self.series, self.fit, self.code, self.current_options())
+        if self.closed:
+            return
+        fit, code = self.app.current_fit()
+        data = self.app.loaded or {}
+        self.info_source.set(module_text(data.get('source')))
+        self.info_target.set(module_text(data.get('target')))
+        if fit:
+            self.fit_detail.set('%s：拟合后角度 = %.6f %+.6f × 原始测量角'
+                                '（n=%d，r=%s，RMSE=%.4f°，Syhat=%.4f）' %
+                                (code or '未知', fit['a'], fit['b'], fit['n'],
+                                 '—' if fit['r'] is None else '%.6f' % fit['r'],
+                                 fit['rmse_deg'], fit['Syhat']))
+        else:
+            self.fit_detail.set('尚无拟合结果：完成至少 3 个角度组后才会出现拟合后角度曲线。')
+        if self.mode.get() == self.MODE_LIVE:
+            live_window = dict(self.LIVE_WINDOWS)[self.live_window.get()]
+            built = live_series(self.app.live_samples, fit, live_window)
+            self.rows_cache, self.summary_cache = built['rows'], built['summary']
+            self.chart.show_live(built['rows'], built['summary'], fit, code,
+                                 self.live_options())
+            self.update_live_status(built['summary'])
+        else:
+            self.rows_cache = comparison_series(data.get('points') or [], fit)
+            self.summary_cache = {}
+            self.chart.show(self.rows_cache, fit, code, self.group_options())
+            self.status.set('%d 组角度均值；橙方块为原始测量角，蓝圆点为按当前拟合函数换算后的角度。'
+                            % len(self.rows_cache))
+        self.window.title('%s · %s' % ('实时角度图' if self.mode.get() == self.MODE_LIVE
+                                       else '角度组均值对比图', code or '当前记录'))
+
+    def update_live_status(self, summary):
+        capture = self.app.capture
+        if capture:
+            remaining = max(0, int(math.ceil(capture['deadline'] - time.monotonic())))
+            head = '采集中 %d° · 还剩 %d 秒' % (capture['actual'], remaining)
+        elif not self.app.sessions:
+            head = '未连接：请先在主窗口连接 IoT 模块，再开始采集'
+        else:
+            head = '已连接，等待开始下一组采集'
+        self.status.set('%s · 帧 %d · 有效 %d · 缺测 %.1f%% · 窗口均值 %s · 拟合后均值 %s' % (
+            head, summary.get('frames', 0), summary.get('valid', 0),
+            summary.get('missing_pct', 0.0),
+            '—' if summary.get('mean_raw') is None else '%.3f°' % summary['mean_raw'],
+            '—' if summary.get('mean_fitted') is None else '%.3f°' % summary['mean_fitted']))
 
     def toggle_spread(self):
-        if self.variables['spread'].get() and self.spread_points is None:
+        if self.group_vars['spread'].get() and self.spread_points is None:
             try:
                 raw_frames = self.app.current_directory() / 'observations.csv'
                 self.spread_points = frame_extremes(raw_frames)
             except (OSError, ValueError) as error:
-                self.variables['spread'].set(False)
+                self.group_vars['spread'].set(False)
                 self.spread_points = {}
-                self.app.messagebox.showerror('原始逐帧数据读取失败', str(error), parent=self.window)
+                self.app.messagebox.showerror('原始逐帧数据读取失败', str(error),
+                                              parent=self.window)
                 return
             total = sum(count for unused_low, unused_high, count in self.spread_points.values())
             self.status.set('已读取 %d 个原始角度样本；灰竖线为该组逐帧最小–最大范围。' % total)
@@ -624,21 +923,42 @@ class AngleCompareWindow:
 
     def export_csv(self):
         from tkinter import filedialog
+        live = self.mode.get() == self.MODE_LIVE
         target = filedialog.asksaveasfilename(
-            parent=self.window, title='导出角度对比数据', defaultextension='.csv',
-            initialfile=(self.code or 'angles') + '_compare.csv', filetypes=[('CSV', '*.csv')])
+            parent=self.window, title='导出角度数据', defaultextension='.csv',
+            initialfile='%s_%s.csv' % (self.app.current_fit()[1] or 'angles',
+                                       'live' if live else 'compare'),
+            filetypes=[('CSV', '*.csv')])
         if not target:
             return
-        fields = ['actual_angle_deg', 'measured_mean_deg', 'fitted_angle_deg']
+        if live:
+            fields = ['elapsed_s', 'measured_deg', 'fitted_deg', 'reference_angle_deg']
+        else:
+            fields = ['actual_angle_deg', 'measured_mean_deg', 'fitted_angle_deg']
         try:
             with open(target, 'w', encoding='utf-8-sig', newline='') as stream:
-                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore')
                 writer.writeheader()
-                writer.writerows({key: row[key] for key in fields} for row in self.series)
+                for row in self.rows_cache:
+                    writer.writerow({key: ('' if row.get(key) is None else row.get(key))
+                                     for key in fields})
         except OSError as error:
             self.app.messagebox.showerror('导出失败', str(error), parent=self.window)
             return
-        self.status.set('已导出对比数据：' + target)
+        self.status.set('已导出 %d 行：%s' % (len(self.rows_cache), target))
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.timer:
+            try:
+                self.window.after_cancel(self.timer)
+            except self.tk.TclError:
+                pass
+            self.timer = None
+        self.app.live_window = None
+        self.window.destroy()
 
 
 class CalibrationApp:
@@ -656,6 +976,13 @@ class CalibrationApp:
         self.capture = None
         self.loaded = None
         self.last_directory = None
+        # Live frame stream behind the real-time monitor: compact
+        # (elapsed_s, measured_deg, reference_deg) tuples plus the clock they are
+        # relative to, so the chart can start as soon as the first frame lands.
+        self.live_samples = []
+        self.live_origin = None
+        self.live_span = None
+        self.live_window = None
         self.closing = False
         self.close_deadline = None
         root.title('IOT 独立角度拟合测试')
@@ -691,14 +1018,14 @@ class CalibrationApp:
         if self.modules:
             self.source.current(0)
             self.source_changed()
-        # Group the three session actions in one strip so the new comparison
-        # button sits directly after 停止并保存 without colliding with the
-        # right-aligned status text.
+        # Group the three session actions in one strip so the live chart button
+        # sits directly after 停止并保存 without colliding with the right-aligned
+        # status text.
         actions = ttk.Frame(setup)
         actions.grid(row=1, column=0, columnspan=4, sticky='w', pady=(8, 2))
         ttk.Button(actions, text='连接 IoT / 新建记录', command=self.connect).pack(side='left')
         ttk.Button(actions, text='停止并保存', command=self.disconnect).pack(side='left', padx=6)
-        ttk.Button(actions, text='角度对比图', command=self.open_angle_chart).pack(side='left')
+        ttk.Button(actions, text='实时角度图', command=self.open_angle_chart).pack(side='left')
         self.connection_status = tk.StringVar(value='未连接')
         ttk.Label(setup, textvariable=self.connection_status, wraplength=1250).grid(
             row=2, column=0, columnspan=4, sticky='w', padx=6)
@@ -801,6 +1128,11 @@ class CalibrationApp:
             self.store, self.sessions, self.states = store, sessions, states
             self.last_directory = store.directory
             self.loaded = store.data
+            # A new session starts the live monitor clock at zero and drops the
+            # previous stream, so the chart never mixes two records.
+            self.live_samples = []
+            self.live_origin = time.monotonic()
+            self.live_span = None
             self.source.configure(state='disabled')
             self.target.configure(state='disabled')
             self.connection_status.set('正在启动 %s → %s；记录：%s' %
@@ -823,28 +1155,63 @@ class CalibrationApp:
         self.source.configure(state='readonly')
         self.target.configure(state='readonly')
 
-    def open_angle_chart(self):
-        """Chart the selected module's raw angles against the current fit.
-
-        Works for a live session and for a record opened from history; both are
-        already available as ``self.loaded``, so nothing is re-read from the car.
-        """
-        data = self.loaded
-        if not data:
-            self.messagebox.showerror('不能显示角度对比图',
-                                      '当前没有采集或历史记录；请先连接 IoT 采集，或打开一条历史记录。',
-                                      parent=self.root)
-            return
-        series = comparison_series(data.get('points') or [], data.get('fit'))
-        if not series:
-            self.messagebox.showerror('不能显示角度对比图',
-                                      '当前记录还没有有效角度组，请先完成至少一组静止采集。',
-                                      parent=self.root)
-            return
+    def current_fit(self):
+        """Return the fit and its code for whatever record is currently loaded."""
+        data = self.loaded or {}
+        fit = data.get('fit')
         code = data.get('fit_code', '')
         if not code and data.get('source') and data.get('target'):
             code = fit_code(data['source'], data['target'])
-        AngleCompareWindow(self, data, code, series, data.get('fit'))
+        return fit, code
+
+    def session_uids(self):
+        """Source/target UIDs of the running session, or (None, None)."""
+        if not self.store:
+            return None, None
+        return self.store.data['source']['uid'], self.store.data['target']['uid']
+
+    def publish_live(self, stamp, measured):
+        """Push one frame to the real-time monitor.
+
+        Every frame of the selected source module is forwarded while a session
+        is connected, not only during the 60 s capture, so the operator can watch
+        the sensor live while lining the vehicle up.
+        """
+        if self.live_origin is None:
+            self.live_origin = stamp
+        capture = self.capture
+        if capture:
+            reference = capture['actual']
+        else:
+            index = self.actual_angle.current()
+            reference = ANGLES[index] if 0 <= index < len(ANGLES) else None
+        self.live_samples.append((stamp - self.live_origin, measured, reference))
+        if len(self.live_samples) > LIVE_SAMPLE_LIMIT:
+            del self.live_samples[:len(self.live_samples) - LIVE_SAMPLE_LIMIT]
+        if self.live_window and not self.live_window.closed:
+            self.live_window.accept(self.live_samples[-1])
+
+    def open_angle_chart(self):
+        """Open the live angle monitor for the selected module.
+
+        The live view charts the frames the IoT modules report while the operator
+        watches, with the current fit applied to every frame. The stored group
+        means stay available from the view switch for reviewing a finished record.
+        """
+        if not self.loaded and not self.live_samples:
+            self.messagebox.showerror('不能显示角度图',
+                                      '当前没有采集或历史记录；请先连接 IoT 采集，或打开一条历史记录。',
+                                      parent=self.root)
+            return
+        if self.live_window and self.live_window.window.winfo_exists():
+            self.live_window.window.deiconify()
+            self.live_window.window.lift()
+            self.live_window.window.focus_set()
+            return
+        default = AngleChartWindow.MODE_LIVE
+        if not self.sessions and self.loaded and not self.loaded.get('fit'):
+            default = AngleChartWindow.MODE_GROUPS
+        self.live_window = AngleChartWindow(self, default)
 
     def start_capture(self):
         if self.capture:
@@ -867,6 +1234,10 @@ class CalibrationApp:
             'deadline': started + CAPTURE_SECONDS, 'finalize_at': started + CAPTURE_SECONDS + 0.6,
             'frames': 0, 'present': 0, 'angles': [], 'distances': [],
         }
+        # Shade the 60 s window of this group on the live chart.
+        if self.live_origin is not None:
+            self.live_span = (started - self.live_origin,
+                              started + CAPTURE_SECONDS - self.live_origin)
         self.store.data['state'] = 'capturing'
         self.store.save()
         self.capture_button.configure(state='disabled')
@@ -888,21 +1259,25 @@ class CalibrationApp:
             self.store.save()
 
     def record_frame(self, data):
-        capture = self.capture
-        if not capture or int(data.get('uid', -1)) != capture['source_uid']:
+        source_uid, target_uid = self.session_uids()
+        if source_uid is None or int(data.get('uid', -1)) != source_uid:
             return
         stamp = float(data.get('host_monotonic', time.monotonic()))
-        if stamp < capture['started'] or stamp > capture['deadline']:
-            return
-        capture['frames'] += 1
         node = next((item for item in data.get('nodes', [])
-                     if int(item.get('uid', -1)) == capture['target_uid']), None)
+                     if int(item.get('uid', -1)) == target_uid), None)
         present = node is not None
-        if present:
-            capture['present'] += 1
         angle = node.get('horizontal') if node else None
         distance = node.get('distance') if node else None
         valid_angle = finite(angle)
+        # The live monitor sees every frame; only the capture window is stored.
+        self.publish_live(stamp, float(angle) if valid_angle else None)
+        capture = self.capture
+        if (not capture or capture['source_uid'] != source_uid
+                or stamp < capture['started'] or stamp > capture['deadline']):
+            return
+        capture['frames'] += 1
+        if present:
+            capture['present'] += 1
         if valid_angle:
             capture['angles'].append(float(angle))
         if finite(distance):
@@ -1211,8 +1586,20 @@ def self_test():
     assert [row['actual_angle_deg'] for row in series] == [0, 5]
     assert abs(series[1]['fitted_angle_deg'] - (fit['a'] + fit['b'] * 14.8223)) < 1e-9
     assert comparison_series([{'actual_angle_deg': 0}], fit) == []
-    print('IOT calibration checks passed: modules, supplied linear fit, error band '
-          'and raw-versus-fitted comparison series.')
+    # The live stream keeps invalid frames as gaps and applies the same a/b.
+    stream = live_series([(0.0, 6.5563, 0), (0.1, None, 0), (0.2, 14.8223, 5)], fit)
+    assert [row['raw'] for row in stream['rows']] == [6.5563, None, 14.8223]
+    assert [row['fitted'] for row in stream['rows']][0] == fit['a'] + fit['b'] * 6.5563
+    assert stream['rows'][1]['fitted'] is None
+    assert stream['summary']['frames'] == 3 and stream['summary']['valid'] == 2
+    assert abs(stream['summary']['missing_pct'] - 100.0 / 3.0) < 1e-9
+    assert stream['summary']['reference_angle_deg'] == 5
+    windowed = live_series([(0.0, 6.5, 0), (30.0, 14.8, 0), (31.0, 15.0, 0)], fit, 10.0)
+    assert [row['x'] for row in windowed['rows']] == [30.0, 31.0]
+    assert live_series([], fit)['rows'] == []
+    assert live_series([], fit)['summary']['frames'] == 0
+    print('IOT calibration checks passed: modules, supplied linear fit, error band, '
+          'raw-versus-fitted comparison series and live frame stream.')
 
 
 def main():
