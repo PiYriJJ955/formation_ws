@@ -444,6 +444,7 @@ class FleetWorkbench:
         self.log.configure(yscrollcommand=scroll.set)
         scroll.pack(side='right', fill='y')
         self.log.pack(fill='both', expand=True)
+        self.make_iot_monitor_page()
         self.make_map()
         self.root.bind('<Escape>', lambda _: self.emergency(), add='+')
         self.root.bind('<space>', self.space_stop, add='+')
@@ -475,6 +476,24 @@ class FleetWorkbench:
         self.app.vars['formation_selected'].set(','.join(self.vehicles.selection()))
 
     def refresh_vehicles(self):
+        # Drop stale duplicate identities kept from an earlier scan (prefer a live SSH row).
+        by_id = {}
+        removed = False
+        for ip, row in list(self.app.robots.items()):
+            identity = row.get('robot_id')
+            if not identity:
+                continue
+            score = (row.get('ssh') == '已连接', row.get('last_seen', ''))
+            if identity in by_id and score > by_id[identity][0]:
+                self.app.robots.pop(by_id[identity][1], None)
+                removed = True
+            elif identity in by_id:
+                self.app.robots.pop(ip, None)
+                removed = True
+            else:
+                by_id[identity] = (score, ip)
+        if removed:
+            self.app.schedule_save()
         for ip in self.vehicles.get_children():
             if ip not in self.app.robots:
                 self.vehicles.delete(ip)
@@ -496,6 +515,7 @@ class FleetWorkbench:
                 self.vehicles.insert('', 'end', iid=ip, values=values)
         if hasattr(self, 'limit_input'):
             self.refresh_limits()
+        self.refresh_iot_vehicle_choices()
 
     def addresses(self):
         addresses = list(self.vehicles.selection())
@@ -1440,8 +1460,6 @@ class FleetWorkbench:
         self.ttk.Label(self.path_tools, textvariable=self.path_pick_status, wraplength=1080).pack(anchor='w', pady=4)
         self.metrics = self.tk.StringVar(value='三角形：基站　圆点：车辆　十字：跟踪目标　虚线：位置误差　灰色：定位无效 / 数据过期')
         self.ttk.Label(page, textvariable=self.metrics, wraplength=1080).pack(fill='x', pady=6)
-        self.make_parameter_page()
-        self.make_iot_monitor_page()
         self.make_iot_extract_page()
         self.make_ros_topics_page()
 
@@ -1449,21 +1467,77 @@ class FleetWorkbench:
         page = self.ttk.Frame(self.app.notebook, padding=10)
         self.app.notebook.add(page, text='IOT 实时监视')
         self.iot_monitor_page = page
-        self.ttk.Label(page, text='选择车辆后可一键识别 / 配置 IOT 串口，再启动实时监视；ugv3 将同时启动主模块和辅助模块。').pack(anchor='w', pady=(0, 6))
-        self.iot_vehicle_box = self.ttk.Combobox(page, state='readonly', width=34)
+        self.ttk.Label(page, text='选择车辆后配置 IOT 串口；实时监视数据按 AGENTS.md 的 12 条有向观测显示。').pack(anchor='w', pady=(0, 6))
+        toolbar = self.ttk.Frame(page)
+        toolbar.pack(fill='x', side='top', anchor='nw')
+        self.iot_vehicle_box = self.ttk.Combobox(toolbar, state='readonly', width=34)
         self.iot_vehicle_box.pack(side='left', padx=(0, 8))
         self.refresh_iot_vehicle_choices()
-        self.ttk.Button(page, text='识别 / 配置 IOT 串口', command=self.edit_iot_vehicle).pack(side='left')
-        self.ttk.Button(page, text='启动 IOT 实时监视', command=self.open_iot).pack(side='left')
-        self.ttk.Button(page, text='停止采集', command=self.stop_iot).pack(side='left', padx=8)
+        self.ttk.Button(toolbar, text='配置并授权全部 IOT 串口', command=self.configure_all_iot_ports).pack(side='left')
+        self.ttk.Button(toolbar, text='一键启动全部 IOT', command=self.configure_all_iot).pack(side='left', padx=8)
+        self.ttk.Button(toolbar, text='配置所选车辆串口', command=self.edit_iot_vehicle).pack(side='left', padx=8)
         self.iot_monitor_status = self.tk.StringVar(value='尚未启动')
-        self.ttk.Label(page, textvariable=self.iot_monitor_status).pack(side='left', padx=8)
+        self.ttk.Label(toolbar, textvariable=self.iot_monitor_status).pack(side='right', padx=8)
+        self.iot_graph_frame = self.ttk.Frame(page)
+        self.iot_graph_frame.pack(fill='both', expand=True, pady=(10, 0))
+        self.iot_graphs = {}
+        from fleet_iot import LINKS, uid_name
+        pairs = [(a, b) for a, b in LINKS if a < b]
+        for index, (a, b) in enumerate(pairs[:6]):
+            box = self.ttk.LabelFrame(self.iot_graph_frame,
+                                      text='%s ↔ %s' % (uid_name(a), uid_name(b)))
+            box.grid(row=index // 3, column=index % 3, sticky='nsew', padx=4, pady=4)
+            self.iot_graph_frame.columnconfigure(index % 3, weight=1)
+            self.iot_graph_frame.rowconfigure(index // 3, weight=1)
+            canvas = self.tk.Canvas(box, background='#f7fafc', height=180, highlightthickness=0)
+            canvas.pack(fill='both', expand=True)
+            canvas.create_text(8, 18, anchor='w', text='距离：等待数据', fill='#1976d2')
+            canvas.create_text(8, 42, anchor='w', text='角度：等待数据', fill='#009688')
+            self.iot_graphs[(a, b)] = canvas
+        self.root.after(500, self.auto_start_iot)
+
+    def auto_start_iot(self):
+        if self.iot_window and not self.iot_window.closed:
+            return
+        if not self.vehicles.selection() and self.app.robots:
+            self.vehicles.selection_set(list(self.app.robots))
+        try:
+            self.open_iot()
+            if self.iot_window and self.iot_window.dialog.winfo_exists():
+                self.iot_window.dialog.withdraw()
+        except Exception as error:
+            self.iot_monitor_status.set('IOT 自动连接失败：' + str(error))
+
+    def configure_all_iot(self):
+        """Start IOT sessions for every vehicle currently listed on page one."""
+        addresses = [ip for ip, row in self.app.robots.items() if row.get('robot_id')]
+        if not addresses:
+            self.app.messagebox.showerror('IOT 串口', '没有已登记的车辆', parent=self.iot_monitor_page)
+            return
+        self.vehicles.selection_set(addresses)
+        self.open_iot()
+        if self.iot_window and self.iot_window.dialog.winfo_exists():
+            self.iot_window.dialog.withdraw()
+        if self.iot_window and any(s.thread.is_alive() for s in self.iot_window.sessions):
+            self.iot_monitor_status.set('已启动全部车辆 IOT，等待观测数据')
+        else:
+            self.iot_monitor_status.set('IOT 未启动：请检查顶部错误信息和串口占用状态')
+
+    def configure_all_iot_ports(self):
+        """Select every scanned vehicle and run the existing serial-permission task."""
+        addresses = list(self.vehicles.get_children())
+        if not addresses:
+            self.app.messagebox.showerror('IOT 串口', '第一页尚未扫描到车辆', parent=self.iot_monitor_page)
+            return
+        self.vehicles.selection_set(addresses)
+        self.serial_permissions()
+        self.iot_monitor_status.set('正在为全部扫描车辆配置串口权限；完成后可点击右侧一键启动 IOT')
 
     def refresh_iot_vehicle_choices(self):
         if not hasattr(self, 'iot_vehicle_box'):
             return
         choices = ['%s · %s' % (ip, self.app.robots[ip].get('robot_id') or '未编号')
-                   for ip in sorted(self.app.robots)]
+                   for ip in self.vehicles.get_children() if ip in self.app.robots]
         self.iot_vehicle_box['values'] = choices
         if choices and not self.iot_vehicle_box.get():
             self.iot_vehicle_box.current(0)
@@ -1483,6 +1557,23 @@ class FleetWorkbench:
             try: self.iot_window.close()
             except Exception: pass
         self.iot_monitor_status.set('已停止')
+
+    def update_iot_graphs(self):
+        if not getattr(self, 'iot_graphs', None):
+            return
+        from fleet_iot import uid_name
+        history = getattr(self.iot_window, 'history', None)
+        for edge, canvas in self.iot_graphs.items():
+            canvas.delete('all')
+            a, b = edge
+            rows = []
+            for source, target in ((a, b), (b, a)):
+                latest = history.latest.get((source, target)) if history else None
+                distance = '—' if not latest or latest[1] is None else '%.3f m' % latest[1]
+                angle = '—' if not latest or latest[2] is None else '%.2f°' % latest[2]
+                rows.append(('%s → %s' % (uid_name(source), uid_name(target)), distance, angle))
+            canvas.create_text(8, 18, anchor='w', text='距离  ' + '    '.join(r[0] + ': ' + r[1] for r in rows), fill='#1976d2')
+            canvas.create_text(8, 44, anchor='w', text='角度  ' + '    '.join(r[0] + ': ' + r[2] for r in rows), fill='#009688')
 
     def make_iot_extract_page(self):
         page = self.ttk.Frame(self.app.notebook, padding=10)
@@ -1794,6 +1885,7 @@ class FleetWorkbench:
         self.metrics.set('\n'.join(metrics) if metrics else '暂无实时误差数据。领航航向对齐到 UWB 地图；跟随车航向以连接时的朝向为 +X 参考。')
 
     def poll(self):
+        self.update_iot_graphs()
         if getattr(self, 'iot_extract', None):
             self.iot_extract.poll()
         if getattr(self, 'ros_topics', None):

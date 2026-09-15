@@ -425,10 +425,14 @@ class IotWindow:
                     self.names.setdefault(sensor['uid'], robot)
             elif event == 'error':
                 self.states[ip] = '失败：' + data['message']
+                if hasattr(self.workbench, 'iot_monitor_status'):
+                    self.workbench.iot_monitor_status.set('%s IOT 失败：%s' % (ip, data['message']))
             elif event == 'stopped':
                 self.states[ip] = '已保存'
             elif event == 'closed' and not self.states[ip].startswith(('失败', '已保存')):
                 self.states[ip] = '已停止'
+        if any(state == '采集中' for state in self.states.values()) and hasattr(self.workbench, 'iot_monitor_status'):
+            self.workbench.iot_monitor_status.set('IOT 正在接收观测数据')
         self.status.set('  |  '.join(ip + ' ' + state for ip, state in self.states.items()))
         first_menu = not self.link_menu.get_children()
         for index, key in enumerate(self.history.links):
