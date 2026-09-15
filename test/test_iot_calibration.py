@@ -8,8 +8,9 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from iot_calibration import (ANGLES, SessionStore, available_targets, discover_modules,
-                             fit_code, linear_fit, prediction_band)
+from iot_calibration import (ANGLES, SessionStore, available_targets, comparison_series,
+                             discover_modules, fit_code, frame_extremes, linear_fit,
+                             prediction_band)
 
 
 class CalibrationChecks(unittest.TestCase):
@@ -52,6 +53,33 @@ class CalibrationChecks(unittest.TestCase):
         self.assertLess(estimate, high)
         with self.assertRaises(ValueError):
             linear_fit(points[:2])
+
+    def test_comparison_series_pairs_raw_and_fitted_angles(self):
+        points = [
+            {'actual_angle_deg': 5, 'measured_mean_deg': 14.8223},
+            {'actual_angle_deg': 10, 'measured_mean_deg': None},
+            {'actual_angle_deg': 0, 'measured_mean_deg': 6.5563},
+        ]
+        fit = {'a': -2.7138, 'b': 0.5128}
+        series = comparison_series(points, fit)
+        self.assertEqual([row['actual_angle_deg'] for row in series], [0, 5])
+        self.assertAlmostEqual(series[0]['fitted_angle_deg'], -2.7138 + 0.5128 * 6.5563)
+        self.assertAlmostEqual(series[1]['fitted_angle_deg'], -2.7138 + 0.5128 * 14.8223)
+        self.assertIsNone(comparison_series(points, None)[0]['fitted_angle_deg'])
+
+    def test_frame_extremes_ignore_missing_angles_per_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'observations.csv'
+            with path.open('w', newline='') as stream:
+                writer = csv.DictWriter(stream, fieldnames=['actual_angle_deg',
+                                                            'measured_horizontal_deg'])
+                writer.writeheader()
+                for row in [('0', '6.5'), ('0', '7.5'), ('0', ''), ('5', '14.0')]:
+                    writer.writerow(dict(zip(['actual_angle_deg',
+                                              'measured_horizontal_deg'], row)))
+            summary = frame_extremes(path)
+        self.assertEqual(summary[0], (6.5, 7.5, 2))
+        self.assertEqual(summary[5], (14.0, 14.0, 1))
 
     def test_session_store_keeps_empty_frames_and_replaces_angle(self):
         source = {'uid': 1, 'board': 's', 'robot': 'ugv1', 'ip': '1.1.1.1',
